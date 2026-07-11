@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-11
 **Status:** Approved
-**Target:** DuckDB ≥ 1.1 (developed and tested against 1.5.4)
+**Target:** DuckDB ≥ 1.3 (Python-style lambda syntax; developed and tested against 1.5.4)
 
 ## Goal
 
