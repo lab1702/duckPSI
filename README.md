@@ -106,3 +106,7 @@ duckdb -c ".read test_psi.sql"
 ```
 
 Prints one PASS/FAIL row per assertion and exits non-zero on any failure.
+
+## License
+
+[MIT](LICENSE)
