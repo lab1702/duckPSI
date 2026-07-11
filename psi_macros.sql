@@ -65,12 +65,14 @@ cur_vals AS (
     WHERE v IS NOT NULL
 ),
 cut_points AS (
-    SELECT coalesce(
-               list_sort(list_distinct(
-                   quantile_cont(v, list_transform(generate_series(1, bins - 1),
-                                                   lambda i: i / bins::DOUBLE))
-               )),
-               []) AS cuts
+    SELECT CASE WHEN bins < 1 THEN error('bins must be >= 1')
+                ELSE coalesce(
+                    list_sort(list_distinct(
+                        quantile_cont(v, list_transform(generate_series(1, bins - 1),
+                                                        lambda i: i / bins::DOUBLE))
+                    )),
+                    [])
+           END AS cuts
     FROM ref_vals
 ),
 totals AS (

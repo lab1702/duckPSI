@@ -121,9 +121,9 @@ the contribution term uses the clamped values.
 
 - Empty (or all-NULL) reference or current table → summary returns `psi = NULL`
   with interpretation `'insufficient data'` rather than erroring.
-- Reference with a single distinct value → all cut points collapse; one bin;
-  PSI is 0 against an identical current population, positive otherwise via the
-  epsilon floor.
+- Reference with a single distinct value → all cut points collapse to a
+  single cut → two bins; PSI is 0 against an identical current population,
+  positive otherwise via the epsilon floor.
 
 ## Testing
 

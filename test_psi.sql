@@ -316,6 +316,27 @@ SELECT 'psi: empty ref is insufficient data',
        'label=' || interpretation
 FROM psi('cont_empty', 'cont_cur', 'score');
 
+-- bins := 1 collapses to zero cut points (len(cuts) = 0), i.e. one open bin
+-- covering the whole range — exercises that branch with a NON-empty reference.
+-- Identical ref/cur means the single bin holds 100% of both, so psi = 0.
+INSERT INTO _results
+SELECT 'psi: bins=1 single bin identity',
+       coalesce(abs(psi) < 1e-12 AND bins_used = 1 AND bins_requested = 1, false),
+       'psi=' || psi::VARCHAR
+FROM psi('cont_ref', 'cont_ref', 'score', bins := 1);
+
+-- Documents the designed empty-side detail semantics: with cur totally empty,
+-- psi_cat_detail still returns one row per reference category (not zero rows).
+-- cur_pct is NULL (true proportion undefined, not clamped) while cur_count = 0
+-- and psi_contrib is still finite via the eps floor. Only the *summary* macros
+-- (psi_cat / psi) collapse this to 'insufficient data'.
+INSERT INTO _results
+SELECT 'cat_detail: empty cur keeps rows, NULL cur_pct, finite contribs',
+       coalesce(count(*) = 3 AND bool_and(cur_pct IS NULL)
+                AND bool_and(isfinite(psi_contrib)) AND bool_and(cur_count = 0), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_cat_detail('cat_ref', 'cat_empty', 'seg');
+
 ------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------

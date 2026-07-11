@@ -60,7 +60,7 @@ SELECT * FROM psi('ref', 'cur', 'score');
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `bins` | `10` | Number of quantile bins (continuous macros only) |
+| `bins` | `10` | Number of quantile bins (continuous macros only); must be `>= 1` |
 | `eps` | `1e-4` | Floor applied to each bin proportion inside the PSI term, so empty bins contribute a large-but-finite amount instead of ±∞ |
 
 ## Semantics and edge cases
@@ -82,6 +82,22 @@ SELECT * FROM psi('ref', 'cur', 'score');
 - **Column matching**: the column name is matched anchored (`^name$`) via
   DuckDB's `COLUMNS()` regex — regex metacharacters in column names are not
   supported.
+- **Case sensitivity**: column matching is case-sensitive — a column created
+  as `Score` is not matched by `'score'` (the error message suggests the
+  right name).
+- **`bins` validation**: `bins` must be `>= 1`; values below 1 raise an error
+  instead of silently behaving like a single bin.
+- **Empty-input detail behavior**: with one side empty, the detail macros
+  still return rows — the empty side's `pct` is `NULL` and contributions are
+  eps-floored finite values; only the summary macros report `'insufficient
+  data'`.
+- **NaN handling**: `NaN` values in continuous data are counted (they sort
+  above all cut points, landing in the top bin) — they are not excluded like
+  `NULL`.
+- **`'(NULL)'` collisions**: in categorical macros, a literal string value
+  `'(NULL)'` merges with real NULLs into one category.
+- **Schema-qualified tables**: names like `'myschema.mytable'` work via
+  `query_table`.
 
 ## Tests
 
