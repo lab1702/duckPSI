@@ -44,6 +44,90 @@ FROM pcts
 ORDER BY category;
 
 -- ==================================================================
+-- psi_detail(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4)
+-- Continuous PSI detail. Cut points are quantile_cont of the
+-- REFERENCE population at i/bins (i = 1 .. bins-1), deduplicated —
+-- heavily tied data can therefore yield fewer bins than requested.
+-- Bins are half-open [lo, hi); bin 1 is (-inf, cut1) and the last
+-- bin is [cut_last, +inf), so out-of-range current values land in
+-- the edge bins. NULLs are excluded from both populations.
+-- ==================================================================
+CREATE OR REPLACE MACRO psi_detail(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4) AS TABLE
+WITH
+ref_vals AS (
+    SELECT v::DOUBLE AS v
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
+    WHERE v IS NOT NULL
+),
+cur_vals AS (
+    SELECT v::DOUBLE AS v
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(cur_tbl))
+    WHERE v IS NOT NULL
+),
+cut_points AS (
+    SELECT coalesce(
+               list_sort(list_distinct(
+                   quantile_cont(v, list_transform(generate_series(1, bins - 1),
+                                                   lambda i: i / bins::DOUBLE))
+               )),
+               []) AS cuts
+    FROM ref_vals
+),
+totals AS (
+    SELECT (SELECT count(*) FROM ref_vals) AS ref_total,
+           (SELECT count(*) FROM cur_vals) AS cur_total
+),
+bin_scaffold AS (
+    SELECT unnest(generate_series(1, len(cuts) + 1)) AS bin FROM cut_points
+),
+ref_counts AS (
+    SELECT len(list_filter(c.cuts, lambda x: r.v >= x)) + 1 AS bin, count(*) AS cnt
+    FROM ref_vals r CROSS JOIN cut_points c
+    GROUP BY 1
+),
+cur_counts AS (
+    SELECT len(list_filter(c.cuts, lambda x: u.v >= x)) + 1 AS bin, count(*) AS cnt
+    FROM cur_vals u CROSS JOIN cut_points c
+    GROUP BY 1
+),
+merged AS (
+    SELECT b.bin,
+           coalesce(r.cnt, 0)::BIGINT AS ref_count,
+           coalesce(u.cnt, 0)::BIGINT AS cur_count,
+           c.cuts,
+           t.ref_total,
+           t.cur_total
+    FROM bin_scaffold b
+    CROSS JOIN cut_points c
+    CROSS JOIN totals t
+    LEFT JOIN ref_counts r USING (bin)
+    LEFT JOIN cur_counts u USING (bin)
+),
+pcts AS (
+    SELECT bin, cuts, ref_count, cur_count,
+           ref_count / nullif(ref_total, 0)::DOUBLE AS ref_pct,
+           cur_count / nullif(cur_total, 0)::DOUBLE AS cur_pct
+    FROM merged
+)
+SELECT
+    bin::INT AS bin,
+    CASE WHEN len(cuts) = 0       THEN '(-inf, inf)'
+         WHEN bin = 1             THEN '< ' || cuts[1]::VARCHAR
+         WHEN bin = len(cuts) + 1 THEN '>= ' || cuts[len(cuts)]::VARCHAR
+         ELSE '[' || cuts[bin - 1]::VARCHAR || ', ' || cuts[bin]::VARCHAR || ')'
+    END AS bin_range,
+    CASE WHEN bin = 1 THEN NULL ELSE cuts[bin - 1] END AS lo,
+    CASE WHEN bin = len(cuts) + 1 THEN NULL ELSE cuts[bin] END AS hi,
+    ref_count,
+    cur_count,
+    ref_pct,
+    cur_pct,
+    (greatest(cur_pct, eps) - greatest(ref_pct, eps))
+      * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps)) AS psi_contrib
+FROM pcts
+ORDER BY bin;
+
+-- ==================================================================
 -- psi_interpret(p)
 -- Shared interpretation label for a total PSI value. The thresholds
 -- exist only here; psi() and psi_cat() both call this.
