@@ -265,6 +265,9 @@ git commit -m "feat: add psi_cat_detail macro and self-checking test harness"
   `category, ref_count, cur_count, ref_pct, cur_pct, psi_contrib`.
 - Produces: `psi_cat(ref_tbl, cur_tbl, col, eps := 1e-4)` — table macro returning exactly one row:
   `psi DOUBLE, interpretation VARCHAR, categories INT, ref_rows BIGINT, cur_rows BIGINT`.
+  Also produces `psi_interpret(p)` — a scalar macro mapping a total PSI value to its label
+  (`NULL → 'insufficient data'`, `< 0.10 → 'stable'`, `< 0.25 → 'moderate shift'`,
+  else `'significant shift'`). The thresholds live ONLY here; Task 4 reuses this macro.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -350,6 +353,17 @@ Append to `psi_macros.sql`:
 
 ```sql
 -- ==================================================================
+-- psi_interpret(p)
+-- Shared interpretation label for a total PSI value. The thresholds
+-- exist only here; psi() and psi_cat() both call this.
+-- ==================================================================
+CREATE OR REPLACE MACRO psi_interpret(p) AS
+    CASE WHEN p IS NULL THEN 'insufficient data'
+         WHEN p < 0.10  THEN 'stable'
+         WHEN p < 0.25  THEN 'moderate shift'
+         ELSE 'significant shift' END;
+
+-- ==================================================================
 -- psi_cat(ref_tbl, cur_tbl, col, eps := 1e-4)
 -- Categorical PSI summary: single row aggregating psi_cat_detail.
 -- ==================================================================
@@ -358,16 +372,17 @@ SELECT
     CASE WHEN coalesce(sum(ref_count), 0) = 0 OR coalesce(sum(cur_count), 0) = 0
          THEN NULL
          ELSE sum(psi_contrib) END AS psi,
-    CASE WHEN coalesce(sum(ref_count), 0) = 0 OR coalesce(sum(cur_count), 0) = 0
-         THEN 'insufficient data'
-         WHEN sum(psi_contrib) < 0.10 THEN 'stable'
-         WHEN sum(psi_contrib) < 0.25 THEN 'moderate shift'
-         ELSE 'significant shift' END AS interpretation,
+    psi_interpret(psi) AS interpretation,
     count(*)::INT AS categories,
     coalesce(sum(ref_count), 0)::BIGINT AS ref_rows,
     coalesce(sum(cur_count), 0)::BIGINT AS cur_rows
 FROM psi_cat_detail(ref_tbl, cur_tbl, col, eps := eps);
 ```
+
+(`psi_interpret(psi)` references the `psi` alias defined in the same SELECT — DuckDB
+supports lateral column-alias reuse; verified on 1.5.4. `sum(psi_contrib)` cannot be
+NULL when both totals are positive, so the NULL branch fires exactly for the
+insufficient-data case.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -632,7 +647,8 @@ git commit -m "feat: add psi_detail continuous macro"
 - Modify: `test_psi.sql` (assertions above the report block; no new fixtures)
 
 **Interfaces:**
-- Consumes: `psi_detail(ref_tbl, cur_tbl, col, bins := bins, eps := eps)` from Task 3.
+- Consumes: `psi_detail(ref_tbl, cur_tbl, col, bins := bins, eps := eps)` from Task 3, and the
+  scalar macro `psi_interpret(p)` from Task 2 (maps a PSI value to its label; NULL → 'insufficient data').
 - Produces: `psi(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4)` — table macro returning exactly one row:
   `psi DOUBLE, interpretation VARCHAR, bins_requested INT, bins_used INT, ref_rows BIGINT, cur_rows BIGINT`.
 
@@ -718,11 +734,7 @@ SELECT
     CASE WHEN coalesce(sum(ref_count), 0) = 0 OR coalesce(sum(cur_count), 0) = 0
          THEN NULL
          ELSE sum(psi_contrib) END AS psi,
-    CASE WHEN coalesce(sum(ref_count), 0) = 0 OR coalesce(sum(cur_count), 0) = 0
-         THEN 'insufficient data'
-         WHEN sum(psi_contrib) < 0.10 THEN 'stable'
-         WHEN sum(psi_contrib) < 0.25 THEN 'moderate shift'
-         ELSE 'significant shift' END AS interpretation,
+    psi_interpret(psi) AS interpretation,
     bins::INT AS bins_requested,
     count(*)::INT AS bins_used,
     coalesce(sum(ref_count), 0)::BIGINT AS ref_rows,
