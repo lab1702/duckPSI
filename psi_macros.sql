@@ -152,3 +152,20 @@ SELECT
     coalesce(sum(ref_count), 0)::BIGINT AS ref_rows,
     coalesce(sum(cur_count), 0)::BIGINT AS cur_rows
 FROM psi_cat_detail(ref_tbl, cur_tbl, col, eps := eps);
+
+-- ==================================================================
+-- psi(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4)
+-- Continuous PSI summary: single row aggregating psi_detail.
+-- bins_used < bins_requested when tied data collapses cut points.
+-- ==================================================================
+CREATE OR REPLACE MACRO psi(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4) AS TABLE
+SELECT
+    CASE WHEN coalesce(sum(ref_count), 0) = 0 OR coalesce(sum(cur_count), 0) = 0
+         THEN NULL
+         ELSE sum(psi_contrib) END AS psi,
+    psi_interpret(psi) AS interpretation,
+    bins::INT AS bins_requested,
+    count(*)::INT AS bins_used,
+    coalesce(sum(ref_count), 0)::BIGINT AS ref_rows,
+    coalesce(sum(cur_count), 0)::BIGINT AS cur_rows
+FROM psi_detail(ref_tbl, cur_tbl, col, bins := bins, eps := eps);

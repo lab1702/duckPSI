@@ -261,6 +261,62 @@ SELECT 'detail: empty ref gives single open bin',
 FROM psi_detail('cont_empty', 'cont_cur', 'score', bins := 4);
 
 ------------------------------------------------------------------
+-- Tests: psi (continuous summary)
+------------------------------------------------------------------
+INSERT INTO _results
+SELECT 'psi: identity is stable zero',
+       coalesce(abs(psi) < 1e-12 AND interpretation = 'stable'
+                AND bins_requested = 10 AND bins_used = 10
+                AND ref_rows = 100 AND cur_rows = 100, false),
+       'psi=' || psi::VARCHAR || ' label=' || interpretation
+FROM psi('cont_ref', 'cont_ref', 'score');
+
+INSERT INTO _results
+SELECT 'psi: known value 0.0847297860 stable',
+       coalesce(abs(psi - 0.08472978603872036) < 1e-9 AND interpretation = 'stable'
+                AND bins_requested = 4 AND bins_used = 4, false),
+       'psi=' || psi::VARCHAR
+FROM psi('cont_ref', 'cont_cur', 'score', bins := 4);
+
+INSERT INTO _results
+SELECT 'psi: bigger shift bigger psi',
+       coalesce(
+           (SELECT psi FROM psi('cont_ref', 'cont_cur20', 'score', bins := 4))
+         > (SELECT psi FROM psi('cont_ref', 'cont_cur',   'score', bins := 4)), false),
+       'monotonicity';
+
+-- eps := 0.2 clamps cur bin1 0.15→0.2: (-0.05)*ln(0.8) + 0.1*ln(1.4) = 0.044804401227831775
+INSERT INTO _results
+SELECT 'psi: eps forwarded to detail',
+       coalesce(abs(psi - 0.044804401227831775) < 1e-9, false),
+       'psi=' || psi::VARCHAR
+FROM psi('cont_ref', 'cont_cur', 'score', bins := 4, eps := 0.2);
+
+INSERT INTO _results
+SELECT 'psi: tied values report bins_used',
+       coalesce(abs(psi) < 1e-12 AND bins_requested = 10 AND bins_used = 2, false),
+       'bins_used=' || bins_used::VARCHAR
+FROM psi('cont_tied', 'cont_tied', 'score');
+
+INSERT INTO _results
+SELECT 'psi: NULLs excluded from ref_rows',
+       coalesce(ref_rows = 100 AND cur_rows = 100, false),
+       'ref_rows=' || ref_rows::VARCHAR
+FROM psi('cont_ref_nulls', 'cont_cur', 'score', bins := 4);
+
+INSERT INTO _results
+SELECT 'psi: empty cur is insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data', false),
+       'label=' || interpretation
+FROM psi('cont_ref', 'cont_empty', 'score');
+
+INSERT INTO _results
+SELECT 'psi: empty ref is insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data', false),
+       'label=' || interpretation
+FROM psi('cont_empty', 'cont_cur', 'score');
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail
