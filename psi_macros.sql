@@ -42,3 +42,29 @@ SELECT category, ref_count, cur_count, ref_pct, cur_pct,
          * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps)) AS psi_contrib
 FROM pcts
 ORDER BY category;
+
+-- ==================================================================
+-- psi_interpret(p)
+-- Shared interpretation label for a total PSI value. The thresholds
+-- exist only here; psi() and psi_cat() both call this.
+-- ==================================================================
+CREATE OR REPLACE MACRO psi_interpret(p) AS
+    CASE WHEN p IS NULL THEN 'insufficient data'
+         WHEN p < 0.10  THEN 'stable'
+         WHEN p < 0.25  THEN 'moderate shift'
+         ELSE 'significant shift' END;
+
+-- ==================================================================
+-- psi_cat(ref_tbl, cur_tbl, col, eps := 1e-4)
+-- Categorical PSI summary: single row aggregating psi_cat_detail.
+-- ==================================================================
+CREATE OR REPLACE MACRO psi_cat(ref_tbl, cur_tbl, col, eps := 1e-4) AS TABLE
+SELECT
+    CASE WHEN coalesce(sum(ref_count), 0) = 0 OR coalesce(sum(cur_count), 0) = 0
+         THEN NULL
+         ELSE sum(psi_contrib) END AS psi,
+    psi_interpret(psi) AS interpretation,
+    count(*)::INT AS categories,
+    coalesce(sum(ref_count), 0)::BIGINT AS ref_rows,
+    coalesce(sum(cur_count), 0)::BIGINT AS cur_rows
+FROM psi_cat_detail(ref_tbl, cur_tbl, col, eps := eps);

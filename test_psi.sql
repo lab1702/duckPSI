@@ -35,6 +35,14 @@ CREATE OR REPLACE TABLE cat_int_ref AS      -- non-VARCHAR categorical column
 
 CREATE OR REPLACE TABLE cat_empty (seg VARCHAR);
 
+CREATE OR REPLACE TABLE cat_mod_ref AS       -- moderate-shift pair
+    SELECT 'A' AS seg FROM range(50)
+    UNION ALL SELECT 'B' FROM range(50);
+
+CREATE OR REPLACE TABLE cat_mod_cur AS
+    SELECT 'A' AS seg FROM range(70)
+    UNION ALL SELECT 'B' FROM range(30);
+
 ------------------------------------------------------------------
 -- Tests: psi_cat_detail
 ------------------------------------------------------------------
@@ -95,6 +103,61 @@ SELECT 'cat_detail: both empty gives zero rows',
        coalesce(count(*) = 0, true),
        'rows=' || count(*)::VARCHAR
 FROM psi_cat_detail('cat_empty', 'cat_empty', 'seg');
+
+------------------------------------------------------------------
+-- Tests: psi_cat
+------------------------------------------------------------------
+INSERT INTO _results
+SELECT 'cat: identity is stable zero',
+       coalesce(abs(psi) < 1e-12 AND interpretation = 'stable'
+                AND categories = 3 AND ref_rows = 100 AND cur_rows = 100, false),
+       'psi=' || psi::VARCHAR || ' label=' || interpretation
+FROM psi_cat('cat_ref', 'cat_ref', 'seg');
+
+INSERT INTO _results
+SELECT 'cat: known value 0.0510825624 stable',
+       coalesce(abs(psi - 0.051082562376599064) < 1e-9 AND interpretation = 'stable', false),
+       'psi=' || psi::VARCHAR
+FROM psi_cat('cat_ref', 'cat_cur', 'seg');
+
+-- (0.7-0.5)*ln(1.4) + (0.3-0.5)*ln(0.6) = 0.169459572077441
+INSERT INTO _results
+SELECT 'cat: moderate shift label',
+       coalesce(abs(psi - 0.169459572077441) < 1e-9 AND interpretation = 'moderate shift', false),
+       'psi=' || psi::VARCHAR || ' label=' || interpretation
+FROM psi_cat('cat_mod_ref', 'cat_mod_cur', 'seg');
+
+-- A: 0.1*ln(1/0.9) ; B: (1e-4 - 0.1)*ln(1e-4/0.1). Total = 0.700620803936098
+INSERT INTO _results
+SELECT 'cat: eps default gives 0.7006208039 significant',
+       coalesce(abs(psi - 0.700620803936098) < 1e-9 AND interpretation = 'significant shift', false),
+       'psi=' || psi::VARCHAR
+FROM psi_cat('cat_ab_ref', 'cat_a_cur', 'seg');
+
+-- Same pair, eps := 0.01: B: (0.01-0.1)*ln(0.1) → total 0.217768709935247
+INSERT INTO _results
+SELECT 'cat: custom eps changes result',
+       coalesce(abs(psi - 0.217768709935247) < 1e-9 AND interpretation = 'moderate shift', false),
+       'psi=' || psi::VARCHAR
+FROM psi_cat('cat_ab_ref', 'cat_a_cur', 'seg', eps := 0.01);
+
+INSERT INTO _results
+SELECT 'cat: empty cur is insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data', false),
+       'label=' || interpretation
+FROM psi_cat('cat_ref', 'cat_empty', 'seg');
+
+INSERT INTO _results
+SELECT 'cat: empty ref is insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data', false),
+       'label=' || interpretation
+FROM psi_cat('cat_empty', 'cat_ref', 'seg');
+
+INSERT INTO _results
+SELECT 'cat: both empty is insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data' AND categories = 0, false),
+       'label=' || interpretation
+FROM psi_cat('cat_empty', 'cat_empty', 'seg');
 
 ------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
