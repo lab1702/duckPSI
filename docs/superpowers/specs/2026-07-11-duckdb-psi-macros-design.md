@@ -53,7 +53,9 @@ FROM psi_detail('ref_table', 'cur_table', 'score');              -- per-bin rows
   ref_rows BIGINT, cur_rows BIGINT`
 - `psi_detail(ref, cur, col, bins := 10, eps := 1e-4)` → one row per bin:
   `bin INT, bin_range VARCHAR, lo DOUBLE, hi DOUBLE, ref_count BIGINT,
-  cur_count BIGINT, ref_pct DOUBLE, cur_pct DOUBLE, psi_contrib DOUBLE`
+  cur_count BIGINT, ref_pct DOUBLE, cur_pct DOUBLE, psi_contrib DOUBLE`.
+  `lo` is NULL for the first bin and `hi` is NULL for the last bin (open ends).
+  `bin_range` renders as `'< c1'`, `'[ck, ck+1)'`, and `'>= cn'` respectively.
 
 ### Categorical variables
 
