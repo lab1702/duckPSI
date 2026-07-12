@@ -10,19 +10,18 @@
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_cat_detail(ref_tbl, cur_tbl, col, eps := 1e-4) AS TABLE
 WITH
-ref_vals AS (
-    SELECT coalesce(v::VARCHAR, '(NULL)') AS v
+-- grouping directly on the casted expression keeps each input single-
+-- referenced, so DuckDB streams the base scans instead of materializing
+-- a per-row VARCHAR copy of each table
+ref_counts AS (
+    SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
+    GROUP BY 1
 ),
-cur_vals AS (
-    SELECT coalesce(v::VARCHAR, '(NULL)') AS v
+cur_counts AS (
+    SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(cur_tbl))
-),
-ref_counts AS (SELECT v, count(*) AS cnt FROM ref_vals GROUP BY v),
-cur_counts AS (SELECT v, count(*) AS cnt FROM cur_vals GROUP BY v),
-totals AS (
-    SELECT (SELECT count(*) FROM ref_vals) AS ref_total,
-           (SELECT count(*) FROM cur_vals) AS cur_total
+    GROUP BY 1
 ),
 merged AS (
     SELECT coalesce(r.v, u.v) AS category,
@@ -32,10 +31,12 @@ merged AS (
     FULL OUTER JOIN cur_counts u ON r.v = u.v
 ),
 pcts AS (
-    SELECT m.category, m.ref_count, m.cur_count,
-           m.ref_count / nullif(t.ref_total, 0)::DOUBLE AS ref_pct,
-           m.cur_count / nullif(t.cur_total, 0)::DOUBLE AS cur_pct
-    FROM merged m CROSS JOIN totals t
+    -- the window sums equal count(*) of each input: the full outer join
+    -- preserves every per-category count from both sides
+    SELECT category, ref_count, cur_count,
+           ref_count / nullif(sum(ref_count) OVER (), 0)::DOUBLE AS ref_pct,
+           cur_count / nullif(sum(cur_count) OVER (), 0)::DOUBLE AS cur_pct
+    FROM merged
 )
 SELECT category, ref_count, cur_count, ref_pct, cur_pct,
        (greatest(cur_pct, eps) - greatest(ref_pct, eps))
@@ -82,13 +83,21 @@ totals AS (
 bin_scaffold AS (
     SELECT unnest(generate_series(1, len(cuts) + 1)) AS bin FROM cut_points
 ),
+-- bin = index of the first cut greater than v (NULL when none -> last
+-- bin); equivalent to counting cuts <= v, so a value exactly on a cut
+-- stays in the upper bin. list_position early-exits at the first match,
+-- unlike a full list_filter pass.
 ref_counts AS (
-    SELECT len(list_filter(c.cuts, lambda x: r.v >= x)) + 1 AS bin, count(*) AS cnt
+    SELECT coalesce(list_position(list_transform(c.cuts, lambda x: r.v < x), true),
+                    len(c.cuts) + 1) AS bin,
+           count(*) AS cnt
     FROM ref_vals r CROSS JOIN cut_points c
     GROUP BY 1
 ),
 cur_counts AS (
-    SELECT len(list_filter(c.cuts, lambda x: u.v >= x)) + 1 AS bin, count(*) AS cnt
+    SELECT coalesce(list_position(list_transform(c.cuts, lambda x: u.v < x), true),
+                    len(c.cuts) + 1) AS bin,
+           count(*) AS cnt
     FROM cur_vals u CROSS JOIN cut_points c
     GROUP BY 1
 ),
