@@ -76,10 +76,6 @@ cut_points AS (
            END AS cuts
     FROM ref_vals
 ),
-totals AS (
-    SELECT (SELECT count(*) FROM ref_vals) AS ref_total,
-           (SELECT count(*) FROM cur_vals) AS cur_total
-),
 bin_scaffold AS (
     SELECT unnest(generate_series(1, len(cuts) + 1)) AS bin FROM cut_points
 ),
@@ -102,15 +98,18 @@ cur_counts AS (
     GROUP BY 1
 ),
 merged AS (
+    -- the window sums equal count(*) of each input: every non-NULL value
+    -- lands in exactly one scaffold bin. Deriving totals here (instead of
+    -- counting ref_vals/cur_vals again) keeps cur_vals single-referenced,
+    -- so it streams instead of being materialized
     SELECT b.bin,
            coalesce(r.cnt, 0)::BIGINT AS ref_count,
            coalesce(u.cnt, 0)::BIGINT AS cur_count,
            c.cuts,
-           t.ref_total,
-           t.cur_total
+           sum(coalesce(r.cnt, 0)) OVER () AS ref_total,
+           sum(coalesce(u.cnt, 0)) OVER () AS cur_total
     FROM bin_scaffold b
     CROSS JOIN cut_points c
-    CROSS JOIN totals t
     LEFT JOIN ref_counts r USING (bin)
     LEFT JOIN cur_counts u USING (bin)
 ),
