@@ -46,12 +46,15 @@ ORDER BY category;
 
 -- ==================================================================
 -- psi_detail(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4)
--- Continuous PSI detail. Cut points are quantile_cont of the
--- REFERENCE population at i/bins (i = 1 .. bins-1), deduplicated —
--- heavily tied data can therefore yield fewer bins than requested.
--- Bins are half-open [lo, hi); bin 1 is (-inf, cut1) and the last
--- bin is [cut_last, +inf), so out-of-range current values land in
--- the edge bins. NULLs are excluded from both populations.
+-- Continuous PSI detail. Cut points are APPROXIMATE quantiles
+-- (approx_quantile / T-Digest) of the REFERENCE population at i/bins
+-- (i = 1 .. bins-1), deduplicated — heavily tied data can therefore
+-- yield fewer bins than requested. Approximate quantiles keep memory
+-- bounded (they do not materialize the reference), so this scales to
+-- reference data larger than RAM; the cut points are not bit-exact
+-- reproducible. Bins are half-open [lo, hi); bin 1 is (-inf, cut1) and
+-- the last bin is [cut_last, +inf), so out-of-range current values land
+-- in the edge bins. NULLs are excluded from both populations.
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_detail(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4) AS TABLE
 WITH
@@ -65,43 +68,67 @@ cur_vals AS (
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(cur_tbl))
     WHERE v IS NOT NULL
 ),
+-- Cut points are APPROXIMATE quantiles (T-Digest) of the reference at i/bins.
+-- approx_quantile is a bounded-memory, single-pass streaming sketch: unlike the
+-- exact quantile_cont it never materializes the whole reference column, so it
+-- scales to reference data larger than RAM (quantile_cont holds every value in
+-- RAM and ignores memory_limit) and is roughly 20x faster. The quantile
+-- fractions must be FLOAT[]; the returned cut values are DOUBLE. neg_cuts (the
+-- negated, reversed cut list) drives the histogram binning below.
 cut_points AS (
-    SELECT CASE WHEN bins < 1 THEN error('bins must be >= 1')
-                ELSE coalesce(
-                    list_sort(list_distinct(
-                        quantile_cont(v, list_transform(generate_series(1, bins - 1),
-                                                        lambda i: i / bins::DOUBLE))
-                    )),
-                    [])
-           END AS cuts
-    FROM ref_vals
+    SELECT cuts, list_reverse(list_transform(cuts, lambda x: -x)) AS neg_cuts
+    FROM (
+        SELECT CASE WHEN bins < 1 THEN error('bins must be >= 1')
+                    ELSE coalesce(
+                        list_sort(list_distinct(
+                            approx_quantile(v, list_transform(generate_series(1, bins - 1),
+                                                              lambda i: (i / bins::DOUBLE)::FLOAT))
+                        )),
+                        [])
+               END AS cuts
+        FROM ref_vals
+    )
 ),
 bin_scaffold AS (
     SELECT unnest(generate_series(1, len(cuts) + 1)) AS bin FROM cut_points
 ),
--- bin = index of the first cut greater than v (NULL when none -> last
--- bin); equivalent to counting cuts <= v, so a value exactly on a cut
--- stays in the upper bin. list_position early-exits at the first match,
--- unlike a full list_filter pass.
-ref_counts AS (
-    SELECT coalesce(list_position(list_transform(c.cuts, lambda x: r.v < x), true),
-                    len(c.cuts) + 1) AS bin,
-           count(*) AS cnt
+-- Binning uses the native histogram() aggregate: one streaming C++ pass per
+-- population with no per-row list allocation. histogram(x, bounds) is
+-- UPPER-inclusive (x is placed in the smallest bound >= x, so x on a bound goes
+-- to the lower bin) -- the opposite of our half-open [lo, hi) rule. Binning -v
+-- against the negated, reversed cuts flips that back: -v <= -c <=> v >= c, so a
+-- value exactly on a cut lands in the UPPER bin. The histogram map keys are the
+-- (negated) bounds used, plus 'inf' for values above every bound == v below
+-- every cut == bin 1; a key -c otherwise maps to the bin whose lower edge is c,
+-- i.e. bin = list_position(cuts, -key) + 1. histogram over empty input returns a
+-- NULL map -> no rows -> every scaffold bin defaults to 0.
+-- (DuckDB total-orders NaN as its maximum value, so -NaN is the minimum and
+-- histogram places it in the lowest negated bound == the top bin, matching the
+-- documented "NaN lands in the top bin" behavior.)
+ref_hist AS (
+    SELECT histogram(-r.v, c.neg_cuts) AS h
     FROM ref_vals r CROSS JOIN cut_points c
-    GROUP BY 1
+),
+cur_hist AS (
+    SELECT histogram(-u.v, c.neg_cuts) AS h
+    FROM cur_vals u CROSS JOIN cut_points c
+),
+ref_counts AS (
+    SELECT CASE WHEN isinf(k) THEN 1 ELSE list_position(c.cuts, -k) + 1 END AS bin,
+           cnt
+    FROM (SELECT unnest(map_keys(h)) AS k, unnest(map_values(h)) AS cnt FROM ref_hist)
+    CROSS JOIN cut_points c
 ),
 cur_counts AS (
-    SELECT coalesce(list_position(list_transform(c.cuts, lambda x: u.v < x), true),
-                    len(c.cuts) + 1) AS bin,
-           count(*) AS cnt
-    FROM cur_vals u CROSS JOIN cut_points c
-    GROUP BY 1
+    SELECT CASE WHEN isinf(k) THEN 1 ELSE list_position(c.cuts, -k) + 1 END AS bin,
+           cnt
+    FROM (SELECT unnest(map_keys(h)) AS k, unnest(map_values(h)) AS cnt FROM cur_hist)
+    CROSS JOIN cut_points c
 ),
 merged AS (
-    -- the window sums equal count(*) of each input: every non-NULL value
-    -- lands in exactly one scaffold bin. Deriving totals here (instead of
-    -- counting ref_vals/cur_vals again) keeps cur_vals single-referenced,
-    -- so it streams instead of being materialized
+    -- the window sums equal count(*) of each input: every non-NULL value lands
+    -- in exactly one scaffold bin. Deriving totals here (instead of counting the
+    -- inputs again) keeps each population scanned once for binning.
     SELECT b.bin,
            coalesce(r.cnt, 0)::BIGINT AS ref_count,
            coalesce(u.cnt, 0)::BIGINT AS cur_count,

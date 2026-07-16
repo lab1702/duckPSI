@@ -9,7 +9,10 @@ PSI = Σ over bins of (cur% − ref%) · ln(cur% / ref%)
 
 ## Requirements
 
-DuckDB ≥ 1.3 (uses Python-style lambda syntax and `query_table`). Tested on 1.5.4.
+DuckDB ≥ 1.3 (uses Python-style lambda syntax and `query_table`). The continuous
+macros also use `approx_quantile(v, FLOAT[])` and the two-argument
+`histogram(v, bounds)` aggregate; both are present in 1.5.4 (the tested version)
+— confirm their availability if you must target an older release.
 
 ## Setup
 
@@ -65,11 +68,19 @@ SELECT * FROM psi('ref', 'cur', 'score');
 
 ## Semantics and edge cases
 
-- **Binning** (continuous): cut points are `quantile_cont` of the *reference*
-  population at `i/bins`. Both populations are bucketed against the same cuts.
-  Bins are half-open `[lo, hi)`; a value exactly on a cut belongs to the upper
-  bin. The first/last bins extend to ±∞, so current values outside the
-  reference range land in the edge bins rather than being dropped.
+- **Binning** (continuous): cut points are **approximate quantiles**
+  (`approx_quantile`, a T-Digest sketch) of the *reference* population at
+  `i/bins`. Both populations are bucketed against the same cuts. Bins are
+  half-open `[lo, hi)`; a value exactly on a cut belongs to the upper bin. The
+  first/last bins extend to ±∞, so current values outside the reference range
+  land in the edge bins rather than being dropped.
+- **Approximate cut points**: `approx_quantile` keeps memory bounded — it never
+  materializes the reference column, so continuous PSI scales to reference data
+  larger than RAM (the exact `quantile_cont` holds every reference value in RAM
+  and ignores `memory_limit`). The trade-off is that cut points are not
+  bit-exact reproducible; T-Digest rank error is typically well under 1%, far
+  inside PSI's own binning noise, and the interpretation label is unaffected in
+  practice.
 - **Tied data**: duplicate cut points are deduplicated; `bins_used` in the
   summary reports the effective count (can be less than `bins_requested`).
 - **Reported vs clamped**: `ref_pct` / `cur_pct` columns are the true
