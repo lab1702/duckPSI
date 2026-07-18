@@ -247,10 +247,11 @@ CREATE OR REPLACE MACRO _psi_all_long(tbl) AS TABLE
   UNPIVOT (SELECT coalesce(COLUMNS(*)::VARCHAR, '(NULL)') FROM query_table(tbl))
   ON COLUMNS(*) INTO NAME col VALUE v;
 
--- Column catalog for a table or view: (col, kind). Accepts a bare name
--- or 'schema.table', matched case-insensitively (mirroring query_table
--- resolution). Errors if a bare name matches tables in more than one
--- schema (query_table would silently pick one) or matches nothing.
+-- Column catalog for a table or view: (col, kind). Accepts a bare name,
+-- 'schema.table', or 'database.schema.table', matched case-insensitively
+-- (mirroring query_table resolution). Errors if a name matches more than
+-- one table across schemas or databases (rather than guessing which one
+-- query_table will bind) or matches nothing.
 CREATE OR REPLACE MACRO _psi_cols(tbl) AS TABLE
 WITH matches AS (
     SELECT database_name, schema_name, table_name, column_name, data_type
@@ -386,8 +387,9 @@ cont_cuts AS (
 ),
 -- The scaffold comes from the catalog (cols), not from observed data, so
 -- every continuous column gets rows even when one side is empty. (bins
--- is validated in the cols CTE, so it errors for any sweep, even one
--- with no continuous columns.)
+-- is validated in the cols CTE: any sweep with at least one non-excluded
+-- column errors on bins < 1; excluding every column yields an empty
+-- result instead of an error.)
 cont_scaffold AS (
     SELECT k.col,
            unnest(generate_series(1, coalesce(len(c.cuts), 0) + 1)) AS bin
