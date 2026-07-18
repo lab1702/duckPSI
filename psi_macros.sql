@@ -291,6 +291,25 @@ WHERE g.ok;
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_all(ref_tbl, cur_tbl, bins := 10, eps := 1e-4, exclude := []) AS TABLE
 WITH
+-- The long-form scans MUST be the first CTEs in this chain, and no other
+-- part of this macro may call query_table: query_table resolves CTE names
+-- in scope (even when the argument is schema-qualified), so a
+-- query_table(cur_tbl) placed after e.g. the cat_ref CTE would silently
+-- read that CTE instead of a user table named 'cat_ref'. Hoisted to the
+-- head, the only CTE name visible to any query_table call is
+-- _psi_all_ref_long (visible from the second body); the guard below turns
+-- that one residual collision into an error instead of a silent
+-- mis-resolution. The ref-side scan sees no CTEs at all, so any ref name
+-- resolves from the catalog.
+_psi_all_ref_long AS (
+    SELECT col, v FROM _psi_all_long(ref_tbl)
+),
+_psi_all_cur_long AS (
+    SELECT col, v FROM _psi_all_long(
+        CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_all_ref_long'
+             THEN error('psi_all: the table name ''_psi_all_ref_long'' is reserved by psi_all; rename that table to sweep it')
+             ELSE cur_tbl END)
+),
 cols AS (
     SELECT coalesce(r.col, c.col) AS col,
            CASE WHEN r.col IS NULL THEN c.kind
@@ -309,13 +328,13 @@ cols AS (
 -- ---- categorical branch: psi_cat_detail's math, partitioned by col ----
 cat_ref AS (
     SELECT l.col, l.v AS category, count(*) AS cnt
-    FROM _psi_all_long(ref_tbl) l JOIN cols k ON l.col = k.col
+    FROM _psi_all_ref_long l JOIN cols k ON l.col = k.col
     WHERE k.kind = 'categorical'
     GROUP BY 1, 2
 ),
 cat_cur AS (
     SELECT l.col, l.v AS category, count(*) AS cnt
-    FROM _psi_all_long(cur_tbl) l JOIN cols k ON l.col = k.col
+    FROM _psi_all_cur_long l JOIN cols k ON l.col = k.col
     WHERE k.kind = 'categorical'
     GROUP BY 1, 2
 ),
@@ -345,14 +364,14 @@ cat_summary AS (
 cont_ref_vals AS (
     SELECT col, vd FROM (
         SELECT l.col, _psi_to_double(l.v) AS vd
-        FROM _psi_all_long(ref_tbl) l JOIN cols k ON l.col = k.col
+        FROM _psi_all_ref_long l JOIN cols k ON l.col = k.col
         WHERE k.kind = 'continuous'
     ) WHERE vd IS NOT NULL
 ),
 cont_cur_vals AS (
     SELECT col, vd FROM (
         SELECT l.col, _psi_to_double(l.v) AS vd
-        FROM _psi_all_long(cur_tbl) l JOIN cols k ON l.col = k.col
+        FROM _psi_all_cur_long l JOIN cols k ON l.col = k.col
         WHERE k.kind = 'continuous'
     ) WHERE vd IS NOT NULL
 ),
