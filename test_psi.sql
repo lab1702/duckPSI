@@ -343,6 +343,86 @@ SELECT 'cat_detail: empty cur keeps rows, NULL cur_pct, finite contribs',
 FROM psi_cat_detail('cat_ref', 'cat_empty', 'seg');
 
 ------------------------------------------------------------------
+-- Tests: user tables named like internal CTEs (query_table shadowing)
+-- query_table resolves in-scope CTE names first — even when the
+-- argument is schema-qualified — so these fixtures deliberately reuse
+-- the macros' internal CTE names and must still resolve from the
+-- catalog, not from a macro's own WITH chain.
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE ref_counts AS        -- internal CTE name in psi_cat_detail
+    SELECT 'A' AS seg FROM range(60)
+    UNION ALL SELECT 'B' FROM range(40);
+
+CREATE OR REPLACE TABLE ref_vals AS          -- internal CTE name in psi_detail
+    SELECT range::DOUBLE + 10 AS score FROM range(100);   -- same data as cont_cur
+
+CREATE OR REPLACE TABLE cut_points AS        -- internal CTE name in psi_detail
+    SELECT range::DOUBLE AS score FROM range(100);        -- same data as cont_ref
+
+INSERT INTO _results
+SELECT 'collide: cat_detail cur table named ref_counts',
+       coalesce(count(*) = 3
+       AND max(CASE WHEN category = 'A' THEN cur_count END) = 60
+       AND max(CASE WHEN category = 'B' THEN cur_count END) = 40
+       AND max(CASE WHEN category = 'C' THEN cur_count END) = 0, false),
+       'cur=' || list(cur_count ORDER BY category)::VARCHAR
+FROM psi_cat_detail('cat_ref', 'ref_counts', 'seg');
+
+INSERT INTO _results
+SELECT 'collide: cat_detail qualified main.ref_counts as cur',
+       coalesce(count(*) = 3
+       AND max(CASE WHEN category = 'A' THEN cur_count END) = 60, false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_cat_detail('cat_ref', 'main.ref_counts', 'seg');
+
+INSERT INTO _results
+SELECT 'collide: cat_detail ref table named ref_counts',
+       coalesce(count(*) = 3
+       AND max(CASE WHEN category = 'A' THEN ref_count END) = 60
+       AND max(CASE WHEN category = 'B' THEN ref_count END) = 40
+       AND max(CASE WHEN category = 'C' THEN ref_count END) = 0, false),
+       'ref=' || list(ref_count ORDER BY category)::VARCHAR
+FROM psi_cat_detail('ref_counts', 'cat_cur', 'seg');
+
+INSERT INTO _results
+SELECT 'collide: cat summary sweeps ref_counts',
+       coalesce(ref_rows = 100 AND cur_rows = 100 AND categories = 3
+                AND isfinite(psi), false),
+       'psi=' || psi::VARCHAR
+FROM psi_cat('cat_ref', 'ref_counts', 'seg');
+
+INSERT INTO _results
+SELECT 'collide: detail cur table named ref_vals',
+       coalesce(bool_and(ref_count = 25)
+       AND list(cur_count ORDER BY bin) = [15, 25, 25, 35], false),
+       'cur=' || list(cur_count ORDER BY bin)::VARCHAR
+FROM psi_detail('cont_ref', 'ref_vals', 'score', bins := 4);
+
+-- ref_vals holds the same data as cont_cur, so this is an identity pair
+INSERT INTO _results
+SELECT 'collide: detail ref table named ref_vals',
+       coalesce(count(*) = 4 AND bool_and(abs(psi_contrib) < 1e-12), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_detail('ref_vals', 'cont_cur', 'score', bins := 4);
+
+INSERT INTO _results
+SELECT 'collide: psi summary known value with cur named ref_vals',
+       coalesce(abs(psi - 0.08472978603872036) < 1e-9 AND cur_rows = 100, false),
+       'psi=' || psi::VARCHAR
+FROM psi('cont_ref', 'ref_vals', 'score', bins := 4);
+
+-- cut_points holds the same data as cont_ref: known value one way,
+-- identity zero the other
+INSERT INTO _results
+SELECT 'collide: table named cut_points as ref and cur',
+       coalesce(
+           (SELECT abs(psi - 0.08472978603872036) < 1e-9
+            FROM psi('cut_points', 'ref_vals', 'score', bins := 4))
+       AND (SELECT abs(psi) < 1e-12
+            FROM psi('cont_ref', 'cut_points', 'score', bins := 4)), false),
+       'both directions';
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail

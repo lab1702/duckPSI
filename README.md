@@ -109,6 +109,14 @@ SELECT * FROM psi('ref', 'cur', 'score');
   `'(NULL)'` merges with real NULLs into one category.
 - **Schema-qualified tables**: names like `'myschema.mytable'` work via
   `query_table`.
+- **Reserved table names**: `query_table` resolves in-scope CTE names before
+  catalog tables (even for schema-qualified arguments), so each macro reserves
+  its first internal CTE name for the *current*-side argument:
+  `'_psi_cat_ref_counts'` (categorical macros) and `'_psi_ref_vals'`
+  (continuous macros). Passing one of these as the current table raises a
+  clear error instead of silently reading the macro's own CTE; they remain
+  fine as the reference table, and every other name — including `ref_counts`,
+  `ref_vals`, or `cut_points` — is safe on either side.
 
 ## Tests
 

@@ -10,25 +10,37 @@
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_cat_detail(ref_tbl, cur_tbl, col, eps := 1e-4) AS TABLE
 WITH
--- grouping directly on the casted expression keeps each input single-
+-- The two query_table scans MUST stay the first CTEs in this chain:
+-- query_table resolves CTE names in scope (even when the argument is
+-- schema-qualified), so a scan placed after an internal CTE would
+-- silently read a like-named CTE instead of the user's table. At the
+-- head, the only CTE name visible to the cur-side scan is
+-- _psi_cat_ref_counts; the guard below turns that one residual
+-- collision into an error instead of a silent mis-resolution. The
+-- ref-side scan sees no CTEs at all, so any ref name resolves from the
+-- catalog.
+-- Grouping directly on the casted expression keeps each input single-
 -- referenced, so DuckDB streams the base scans instead of materializing
--- a per-row VARCHAR copy of each table
-ref_counts AS (
+-- a per-row VARCHAR copy of each table.
+_psi_cat_ref_counts AS (
     SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
     GROUP BY 1
 ),
-cur_counts AS (
+_psi_cat_cur_counts AS (
     SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
-    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(cur_tbl))
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
+        CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_cat_ref_counts'
+             THEN error('psi_cat_detail: the table name ''_psi_cat_ref_counts'' is reserved by psi_cat_detail; rename that table to compare it')
+             ELSE cur_tbl END))
     GROUP BY 1
 ),
 merged AS (
     SELECT coalesce(r.v, u.v) AS category,
            coalesce(r.cnt, 0)::BIGINT AS ref_count,
            coalesce(u.cnt, 0)::BIGINT AS cur_count
-    FROM ref_counts r
-    FULL OUTER JOIN cur_counts u ON r.v = u.v
+    FROM _psi_cat_ref_counts r
+    FULL OUTER JOIN _psi_cat_cur_counts u ON r.v = u.v
 ),
 pcts AS (
     -- the window sums equal count(*) of each input: the full outer join
@@ -58,14 +70,26 @@ ORDER BY category;
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_detail(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4) AS TABLE
 WITH
-ref_vals AS (
+-- The two query_table scans MUST stay the first CTEs in this chain, and
+-- no other part of this macro may call query_table: query_table resolves
+-- CTE names in scope (even when the argument is schema-qualified), so a
+-- scan placed after an internal CTE would silently read a like-named CTE
+-- instead of the user's table. At the head, the only CTE name visible to
+-- the cur-side scan is _psi_ref_vals; the guard below turns that one
+-- residual collision into an error instead of a silent mis-resolution.
+-- The ref-side scan sees no CTEs at all, so any ref name resolves from
+-- the catalog.
+_psi_ref_vals AS (
     SELECT v::DOUBLE AS v
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
     WHERE v IS NOT NULL
 ),
-cur_vals AS (
+_psi_cur_vals AS (
     SELECT v::DOUBLE AS v
-    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(cur_tbl))
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
+        CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_ref_vals'
+             THEN error('psi_detail: the table name ''_psi_ref_vals'' is reserved by psi_detail; rename that table to compare it')
+             ELSE cur_tbl END))
     WHERE v IS NOT NULL
 ),
 -- Cut points are APPROXIMATE quantiles (T-Digest) of the reference at i/bins.
@@ -86,7 +110,7 @@ cut_points AS (
                         )),
                         [])
                END AS cuts
-        FROM ref_vals
+        FROM _psi_ref_vals
     )
 ),
 bin_scaffold AS (
@@ -107,11 +131,11 @@ bin_scaffold AS (
 -- documented "NaN lands in the top bin" behavior.)
 ref_hist AS (
     SELECT histogram(-r.v, c.neg_cuts) AS h
-    FROM ref_vals r CROSS JOIN cut_points c
+    FROM _psi_ref_vals r CROSS JOIN cut_points c
 ),
 cur_hist AS (
     SELECT histogram(-u.v, c.neg_cuts) AS h
-    FROM cur_vals u CROSS JOIN cut_points c
+    FROM _psi_cur_vals u CROSS JOIN cut_points c
 ),
 ref_counts AS (
     SELECT CASE WHEN isinf(k) THEN 1 ELSE list_position(c.cuts, -k) + 1 END AS bin,
