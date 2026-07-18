@@ -272,3 +272,156 @@ guard AS (
 SELECT m.column_name AS col, _psi_kind(m.data_type) AS kind
 FROM matches m CROSS JOIN guard g
 WHERE g.ok;
+
+-- ==================================================================
+-- psi_all(ref_tbl, cur_tbl, bins := 10, eps := 1e-4, exclude := [])
+-- Multi-column PSI sweep: one row per column across both tables,
+-- ordered biggest drift first (NULL psi rows last). Kind is dispatched
+-- from the DECLARED column type (numeric/temporal -> continuous via
+-- psi_detail's math, everything else -> categorical via psi_cat_detail's
+-- math); a column whose kind differs between the tables is analyzed as
+-- categorical and flagged status = 'type mismatch'; columns present on
+-- one side only are flagged 'ref only' / 'cur only' with psi = NULL.
+-- exclude lists column names (exact, case-sensitive) to skip entirely.
+-- Cost is a small constant number of scans of each input regardless of
+-- column count; for a single column, psi()/psi_cat() remain the fast
+-- path (native histogram binning vs per-row list ops here). Continuous
+-- results can differ from a per-column psi() call within approx-
+-- quantile sketch noise; categorical results match psi_cat exactly.
+-- ==================================================================
+CREATE OR REPLACE MACRO psi_all(ref_tbl, cur_tbl, bins := 10, eps := 1e-4, exclude := []) AS TABLE
+WITH
+cols AS (
+    SELECT coalesce(r.col, c.col) AS col,
+           CASE WHEN r.col IS NULL THEN c.kind
+                WHEN c.col IS NULL THEN r.kind
+                WHEN r.kind = 'continuous' AND c.kind = 'continuous' THEN 'continuous'
+                ELSE 'categorical' END AS kind,
+           CASE WHEN r.col IS NULL THEN 'cur only'
+                WHEN c.col IS NULL THEN 'ref only'
+                WHEN r.kind <> c.kind THEN 'type mismatch'
+                ELSE 'ok' END AS status
+    FROM _psi_cols(ref_tbl) r
+    FULL OUTER JOIN _psi_cols(cur_tbl) c ON r.col = c.col
+    -- the ::VARCHAR[] cast also types the [] default (untyped otherwise)
+    WHERE NOT list_contains(exclude::VARCHAR[], coalesce(r.col, c.col))
+),
+-- ---- categorical branch: psi_cat_detail's math, partitioned by col ----
+cat_ref AS (
+    SELECT l.col, l.v AS category, count(*) AS cnt
+    FROM _psi_all_long(ref_tbl) l JOIN cols k ON l.col = k.col
+    WHERE k.kind = 'categorical'
+    GROUP BY 1, 2
+),
+cat_cur AS (
+    SELECT l.col, l.v AS category, count(*) AS cnt
+    FROM _psi_all_long(cur_tbl) l JOIN cols k ON l.col = k.col
+    WHERE k.kind = 'categorical'
+    GROUP BY 1, 2
+),
+cat_merged AS (
+    SELECT coalesce(r.col, u.col) AS col,
+           coalesce(r.cnt, 0)::BIGINT AS ref_count,
+           coalesce(u.cnt, 0)::BIGINT AS cur_count
+    FROM cat_ref r FULL OUTER JOIN cat_cur u
+      ON r.col = u.col AND r.category = u.category
+),
+cat_pcts AS (
+    SELECT col, ref_count, cur_count,
+           ref_count / nullif(sum(ref_count) OVER (PARTITION BY col), 0)::DOUBLE AS ref_pct,
+           cur_count / nullif(sum(cur_count) OVER (PARTITION BY col), 0)::DOUBLE AS cur_pct
+    FROM cat_merged
+),
+cat_summary AS (
+    SELECT col,
+           CASE WHEN sum(ref_count) = 0 OR sum(cur_count) = 0 THEN NULL
+                ELSE sum(_psi_contrib(cur_pct, ref_pct, eps)) END AS psi,
+           count(*)::INT AS groups,
+           sum(ref_count)::BIGINT AS ref_rows,
+           sum(cur_count)::BIGINT AS cur_rows
+    FROM cat_pcts GROUP BY col
+),
+-- ---- continuous branch: psi_detail's math, partitioned by col ----
+cont_ref_vals AS (
+    SELECT col, vd FROM (
+        SELECT l.col, _psi_to_double(l.v) AS vd
+        FROM _psi_all_long(ref_tbl) l JOIN cols k ON l.col = k.col
+        WHERE k.kind = 'continuous'
+    ) WHERE vd IS NOT NULL
+),
+cont_cur_vals AS (
+    SELECT col, vd FROM (
+        SELECT l.col, _psi_to_double(l.v) AS vd
+        FROM _psi_all_long(cur_tbl) l JOIN cols k ON l.col = k.col
+        WHERE k.kind = 'continuous'
+    ) WHERE vd IS NOT NULL
+),
+cont_cuts AS (
+    SELECT col, list_sort(list_distinct(
+             approx_quantile(vd, list_transform(generate_series(1, bins - 1),
+                                                lambda i: (i / bins::DOUBLE)::FLOAT)))) AS cuts
+    FROM cont_ref_vals GROUP BY col
+),
+-- The scaffold comes from the catalog (cols), not from observed data, so
+-- every continuous column gets rows even when one side is empty; the
+-- bins guard lives here so it fires whenever a continuous column exists.
+cont_scaffold AS (
+    SELECT k.col,
+           unnest(generate_series(1, CASE WHEN bins < 1 THEN error('bins must be >= 1')
+                                          ELSE coalesce(len(c.cuts), 0) + 1 END)) AS bin
+    FROM cols k LEFT JOIN cont_cuts c ON k.col = c.col
+    WHERE k.kind = 'continuous'
+),
+-- Half-open [lo, hi) binning: bin = 1 + count of cuts <= value, so a
+-- value exactly on a cut lands in the upper bin. NaN compares greater
+-- than every cut (DuckDB total order) -> top bin, matching psi_detail.
+-- A column with no cuts row (empty ref side) gets NULL -> bin 1.
+cont_ref_binned AS (
+    SELECT v.col, 1 + coalesce(len(list_filter(c.cuts, lambda x: v.vd >= x)), 0) AS bin,
+           count(*) AS cnt
+    FROM cont_ref_vals v LEFT JOIN cont_cuts c ON v.col = c.col
+    GROUP BY 1, 2
+),
+cont_cur_binned AS (
+    SELECT v.col, 1 + coalesce(len(list_filter(c.cuts, lambda x: v.vd >= x)), 0) AS bin,
+           count(*) AS cnt
+    FROM cont_cur_vals v LEFT JOIN cont_cuts c ON v.col = c.col
+    GROUP BY 1, 2
+),
+cont_merged AS (
+    SELECT s.col, s.bin,
+           coalesce(r.cnt, 0)::BIGINT AS ref_count,
+           coalesce(u.cnt, 0)::BIGINT AS cur_count,
+           sum(coalesce(r.cnt, 0)) OVER (PARTITION BY s.col) AS ref_total,
+           sum(coalesce(u.cnt, 0)) OVER (PARTITION BY s.col) AS cur_total
+    FROM cont_scaffold s
+    LEFT JOIN cont_ref_binned r ON s.col = r.col AND s.bin = r.bin
+    LEFT JOIN cont_cur_binned u ON s.col = u.col AND s.bin = u.bin
+),
+cont_summary AS (
+    SELECT col,
+           CASE WHEN max(ref_total) = 0 OR max(cur_total) = 0 THEN NULL
+                ELSE sum(_psi_contrib(cur_count / nullif(cur_total, 0)::DOUBLE,
+                                      ref_count / nullif(ref_total, 0)::DOUBLE, eps)) END AS psi,
+           count(*)::INT AS groups,
+           max(ref_total)::BIGINT AS ref_rows,
+           max(cur_total)::BIGINT AS cur_rows
+    FROM cont_merged GROUP BY col
+),
+summaries AS (
+    SELECT * FROM cat_summary
+    UNION ALL
+    SELECT * FROM cont_summary
+)
+SELECT k.col AS "column",
+       k.kind,
+       k.status,
+       s.psi,
+       psi_interpret(s.psi) AS interpretation,
+       -- one-sided columns are never scored, so a group count would be
+       -- misleading (it reflects only the present side)
+       CASE WHEN k.status IN ('ref only', 'cur only') THEN NULL ELSE s.groups END AS groups,
+       coalesce(s.ref_rows, 0) AS ref_rows,
+       coalesce(s.cur_rows, 0) AS cur_rows
+FROM cols k LEFT JOIN summaries s ON k.col = s.col
+ORDER BY s.psi DESC NULLS LAST, k.col;

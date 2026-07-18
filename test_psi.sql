@@ -420,6 +420,96 @@ SELECT 'all-helpers: _psi_cols kinds for mixed table',
 FROM _psi_cols('sweep_ref');
 
 ------------------------------------------------------------------
+-- Tests: psi_all (core)
+------------------------------------------------------------------
+CREATE OR REPLACE VIEW sweep_ref_ts AS SELECT epoch(ts) AS ts_e FROM sweep_ref;
+CREATE OR REPLACE VIEW sweep_cur_ts AS SELECT epoch(ts) AS ts_e FROM sweep_cur;
+
+INSERT INTO _results
+SELECT 'all: macro exists',
+       coalesce(count(*) >= 1, false),
+       'found ' || count(*)::VARCHAR
+FROM duckdb_functions() WHERE function_name = 'psi_all';
+
+INSERT INTO _results
+SELECT 'all: one row per column with correct kinds',
+       coalesce(count(*) = 10
+            AND bool_and(CASE WHEN "column" IN ('id', 'score', 'amount', 'ts', 'd')
+                              THEN kind = 'continuous' AND status = 'ok'
+                              WHEN "column" IN ('seg', 'flag')
+                              THEN kind = 'categorical' AND status = 'ok'
+                              ELSE true END), false),
+       string_agg("column" || ':' || kind || ':' || status, ', ' ORDER BY "column")
+FROM psi_all('sweep_ref', 'sweep_cur');
+
+INSERT INTO _results
+SELECT 'all: continuous column agrees with psi()',
+       coalesce(abs(
+           (SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'score')
+         - (SELECT psi FROM psi('sweep_ref', 'sweep_cur', 'score'))) < 1e-9, false),
+       'score compared';
+
+INSERT INTO _results
+SELECT 'all: DECIMAL column agrees with psi()',
+       coalesce(abs(
+           (SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'amount')
+         - (SELECT psi FROM psi('sweep_ref', 'sweep_cur', 'amount'))) < 1e-9, false),
+       'amount compared';
+
+INSERT INTO _results
+SELECT 'all: categorical column equals psi_cat()',
+       coalesce(abs(
+           (SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'seg')
+         - (SELECT psi FROM psi_cat('sweep_ref', 'sweep_cur', 'seg'))) < 1e-12, false),
+       'seg compared';
+
+INSERT INTO _results
+SELECT 'all: timestamp column matches psi() over an epoch view',
+       coalesce(abs(
+           (SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'ts')
+         - (SELECT psi FROM psi('sweep_ref_ts', 'sweep_cur_ts', 'ts_e'))) < 1e-9, false),
+       'ts compared';
+
+INSERT INTO _results
+SELECT 'all: identical boolean distribution is exactly zero',
+       coalesce(abs((SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'flag')) < 1e-12
+            AND (SELECT groups FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'flag') = 2, false),
+       'flag checked';
+
+INSERT INTO _results
+SELECT 'all: groups and row counts per kind',
+       coalesce(
+           max(CASE WHEN "column" = 'score' THEN groups END) = 10
+       AND max(CASE WHEN "column" = 'seg' THEN groups END) = 4   -- a, b, c, (NULL)
+       AND bool_and(CASE WHEN status = 'ok' THEN ref_rows = 200 AND cur_rows = 180 ELSE true END), false),
+       'groups/rows checked'
+FROM psi_all('sweep_ref', 'sweep_cur');
+
+INSERT INTO _results
+SELECT 'all: sorted by psi desc, nulls last',
+       coalesce(
+           (SELECT "column" FROM psi_all('sweep_ref', 'sweep_cur') LIMIT 1) = 'ts'
+       AND (SELECT bool_and(psi IS NULL)
+            FROM (SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') OFFSET 8)), false),
+       'order checked';
+
+INSERT INTO _results
+SELECT 'all: bins parameter forwarded',
+       coalesce(
+           (SELECT groups FROM psi_all('sweep_ref', 'sweep_cur', bins := 4) WHERE "column" = 'score') = 4
+       AND abs((SELECT psi FROM psi_all('sweep_ref', 'sweep_cur', bins := 4) WHERE "column" = 'score')
+             - (SELECT psi FROM psi('sweep_ref', 'sweep_cur', 'score', bins := 4))) < 1e-9, false),
+       'bins=4 checked';
+
+-- Same fixture + eps as the existing 'cat: custom eps changes result' test.
+INSERT INTO _results
+SELECT 'all: eps parameter forwarded',
+       coalesce(abs(
+           (SELECT psi FROM psi_all('cat_ab_ref', 'cat_a_cur', eps := 0.01) WHERE "column" = 'seg')
+         - 0.217768709935247) < 1e-9, false),
+       'eps=0.01 checked';
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail
