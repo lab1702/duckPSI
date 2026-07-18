@@ -510,6 +510,108 @@ SELECT 'all: eps parameter forwarded',
        'eps=0.01 checked';
 
 ------------------------------------------------------------------
+-- Tests: psi_all (statuses, exclude, edges)
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE nan_sweep_ref AS SELECT (range % 10) / 10.0 AS x FROM range(100);
+CREATE OR REPLACE TABLE nan_sweep_cur AS
+    SELECT (range % 10) / 10.0 AS x FROM range(100)
+    UNION ALL SELECT 'nan'::DOUBLE;
+
+INSERT INTO _results
+SELECT 'all: identity sweep is all zero and ok',
+       coalesce(count(*) = 9 AND bool_and(status = 'ok') AND bool_and(abs(psi) < 1e-12), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_all('sweep_ref', 'sweep_ref');
+
+INSERT INTO _results
+SELECT 'all: ref-only column flagged, not scored',
+       coalesce(bool_and(status = 'ref only' AND psi IS NULL
+                     AND interpretation = 'insufficient data'
+                     AND groups IS NULL AND ref_rows = 200 AND cur_rows = 0), false),
+       'only_ref checked'
+FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'only_ref';
+
+INSERT INTO _results
+SELECT 'all: cur-only column flagged, not scored',
+       coalesce(bool_and(status = 'cur only' AND psi IS NULL
+                     AND interpretation = 'insufficient data'
+                     AND groups IS NULL AND ref_rows = 0 AND cur_rows = 180), false),
+       'only_cur checked'
+FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'only_cur';
+
+-- mix is DOUBLE in ref, VARCHAR in cur, with identical value distributions:
+-- analyzed as categorical (5 distinct values), flagged, psi exactly 0.
+INSERT INTO _results
+SELECT 'all: type mismatch analyzed as categorical and flagged',
+       coalesce(bool_and(kind = 'categorical' AND status = 'type mismatch'
+                     AND abs(psi) < 1e-12 AND groups = 5), false),
+       'mix checked'
+FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'mix';
+
+INSERT INTO _results
+SELECT 'all: exclude drops columns from the sweep',
+       coalesce(count(*) = 8
+            AND count(*) FILTER (WHERE "column" IN ('id', 'only_ref')) = 0, false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_all('sweep_ref', 'sweep_cur', exclude := ['id', 'only_ref']);
+
+INSERT INTO _results
+SELECT 'all: NaN counted in top bin like psi()',
+       coalesce(
+           (SELECT cur_rows FROM psi_all('nan_sweep_ref', 'nan_sweep_cur')) = 101
+       AND abs((SELECT psi FROM psi_all('nan_sweep_ref', 'nan_sweep_cur'))
+             - (SELECT psi FROM psi('nan_sweep_ref', 'nan_sweep_cur', 'x'))) < 1e-9, false),
+       'nan checked';
+
+INSERT INTO _results
+SELECT 'all: drifting null rate scored like psi_cat',
+       coalesce(abs(
+           (SELECT psi FROM psi_all('cat_ref_nulls', 'cat_ref'))
+         - (SELECT psi FROM psi_cat('cat_ref_nulls', 'cat_ref', 'seg'))) < 1e-12
+       AND (SELECT psi FROM psi_all('cat_ref_nulls', 'cat_ref')) > 0, false),
+       'null drift checked';
+
+INSERT INTO _results
+SELECT 'all: empty side is insufficient data',
+       coalesce(count(*) = 1
+            AND bool_and(psi IS NULL AND interpretation = 'insufficient data'
+                     AND status = 'ok'), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_all('cont_empty', 'cont_ref');
+
+INSERT INTO _results
+SELECT 'all: both empty is insufficient data',
+       coalesce(count(*) = 1
+            AND bool_and(psi IS NULL AND interpretation = 'insufficient data'
+                     AND ref_rows = 0 AND cur_rows = 0), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_all('cat_empty', 'cat_empty');
+
+INSERT INTO _results
+SELECT 'all: bins=1 single-bin identity',
+       coalesce(bool_and(abs(psi) < 1e-12 AND groups = 1), false),
+       'bins=1 checked'
+FROM psi_all('cont_ref', 'cont_ref', bins := 1);
+
+-- cat_ref has only seg, cont_ref has only score: zero shared columns is
+-- not an error -- you get one-sided status rows for everything.
+INSERT INTO _results
+SELECT 'all: no shared columns gives status rows only',
+       coalesce(count(*) = 2
+            AND bool_and(psi IS NULL AND groups IS NULL
+                     AND status IN ('ref only', 'cur only')), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_all('cat_ref', 'cont_ref');
+
+CREATE SCHEMA IF NOT EXISTS sweep_s1;
+CREATE OR REPLACE TABLE sweep_s1.qual AS SELECT range::DOUBLE AS x FROM range(50);
+INSERT INTO _results
+SELECT 'all: schema-qualified table names work',
+       coalesce(bool_and(abs(psi) < 1e-12 AND status = 'ok'), false),
+       'qualified checked'
+FROM psi_all('sweep_s1.qual', 'sweep_s1.qual');
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail
