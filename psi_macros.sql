@@ -206,3 +206,69 @@ SELECT
     coalesce(sum(ref_count), 0)::BIGINT AS ref_rows,
     coalesce(sum(cur_count), 0)::BIGINT AS cur_rows
 FROM psi_detail(ref_tbl, cur_tbl, col, bins := bins, eps := eps);
+
+-- ==================================================================
+-- psi_all internal helpers. Underscore-prefixed macros are
+-- implementation details of psi_all, not public API.
+-- ==================================================================
+
+-- Maps a duckdb_columns().data_type string to the PSI flavor psi_all
+-- runs for that column. Numeric and temporal types are continuous
+-- (temporal values are compared on the epoch-seconds axis); everything
+-- else is categorical.
+CREATE OR REPLACE MACRO _psi_kind(dt) AS
+  CASE WHEN dt IN ('TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT',
+                   'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'UHUGEINT',
+                   'FLOAT', 'DOUBLE', 'DATE', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE')
+         OR dt LIKE 'DECIMAL%'
+       THEN 'continuous' ELSE 'categorical' END;
+
+-- Long-format VARCHAR cell -> DOUBLE. The TIMESTAMPTZ (not TIMESTAMP)
+-- cast is deliberate: it parses DATE / TIMESTAMP / TIMESTAMPTZ strings
+-- alike AND honors explicit UTC offsets, which a TIMESTAMP cast would
+-- silently drop (skewing epochs across DST-mixed data). Non-numeric,
+-- non-temporal strings -- including the '(NULL)' sentinel -- yield NULL,
+-- which reproduces the continuous NULL-exclusion rule.
+CREATE OR REPLACE MACRO _psi_to_double(v) AS
+  coalesce(try_cast(v AS DOUBLE), epoch(try_cast(v AS TIMESTAMPTZ)));
+
+-- The eps-floored PSI contribution term (same formula the single-column
+-- macros inline).
+CREATE OR REPLACE MACRO _psi_contrib(cur_pct, ref_pct, eps) AS
+  (greatest(cur_pct, eps) - greatest(ref_pct, eps))
+    * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps));
+
+-- Reshapes a table to (col, v) long form, one row per cell. The
+-- coalesce sentinel is load-bearing: UNPIVOT drops NULL cells, so NULLs
+-- are smuggled through as '(NULL)' -- which doubles as the categorical
+-- NULL category. The VARCHAR round trip is exact for DOUBLE (DuckDB
+-- prints shortest-round-trip floats).
+CREATE OR REPLACE MACRO _psi_all_long(tbl) AS TABLE
+  UNPIVOT (SELECT coalesce(COLUMNS(*)::VARCHAR, '(NULL)') FROM query_table(tbl))
+  ON COLUMNS(*) INTO NAME col VALUE v;
+
+-- Column catalog for a table or view: (col, kind). Accepts a bare name
+-- or 'schema.table', matched case-insensitively (mirroring query_table
+-- resolution). Errors if a bare name matches tables in more than one
+-- schema (query_table would silently pick one) or matches nothing.
+CREATE OR REPLACE MACRO _psi_cols(tbl) AS TABLE
+WITH matches AS (
+    SELECT database_name, schema_name, table_name, column_name, data_type
+    FROM duckdb_columns()
+    WHERE NOT "internal"
+      AND CASE WHEN contains(tbl, '.')
+               THEN lower(schema_name || '.' || table_name) = lower(tbl)
+               ELSE lower(table_name) = lower(tbl) END
+),
+guard AS (
+    SELECT CASE
+        WHEN count(DISTINCT database_name || '.' || schema_name || '.' || table_name) > 1
+          THEN error('psi_all: table name ''' || tbl || ''' matches more than one table; qualify as schema.table')
+        WHEN count(*) = 0
+          THEN error('psi_all: table ''' || tbl || ''' not found')
+        ELSE true END AS ok
+    FROM matches
+)
+SELECT m.column_name AS col, _psi_kind(m.data_type) AS kind
+FROM matches m CROSS JOIN guard g
+WHERE g.ok;

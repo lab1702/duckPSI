@@ -343,6 +343,83 @@ SELECT 'cat_detail: empty cur keeps rows, NULL cur_pct, finite contribs',
 FROM psi_cat_detail('cat_ref', 'cat_empty', 'seg');
 
 ------------------------------------------------------------------
+-- Fixtures: psi_all sweep (mixed-type pair; shared by the psi_all tasks)
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE sweep_ref AS
+SELECT i AS id,
+       (i % 10) / 10.0 AS score,
+       ((i % 7) * 11.5)::DECIMAL(10,2) AS amount,
+       CASE i % 4 WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' ELSE NULL END AS seg,
+       i % 2 = 0 AS flag,
+       TIMESTAMP '2024-01-01' + INTERVAL (i % 30) DAY AS ts,
+       (DATE '2024-01-01' + INTERVAL (i % 30) DAY)::DATE AS d,
+       (i % 5)::DOUBLE AS mix,
+       i AS only_ref
+FROM range(1, 201) t(i);
+
+CREATE OR REPLACE TABLE sweep_cur AS
+SELECT i AS id,
+       ((i % 10) / 10.0) + 0.25 AS score,                -- shifted
+       ((i % 7) * 11.5)::DECIMAL(10,2) AS amount,        -- same distribution
+       CASE i % 4 WHEN 0 THEN 'a' WHEN 1 THEN 'a' WHEN 2 THEN 'c' ELSE NULL END AS seg,  -- shifted
+       i % 2 = 0 AS flag,                                -- identical proportions
+       TIMESTAMP '2024-02-01' + INTERVAL (i % 30) DAY AS ts,   -- shifted one month
+       (DATE '2024-01-01' + INTERVAL (i % 30) DAY)::DATE AS d, -- near-identical
+       ((i % 5)::DOUBLE)::VARCHAR AS mix,                -- type mismatch vs ref (DOUBLE there)
+       'x' || (i % 3)::VARCHAR AS only_cur
+FROM range(1, 181) t(i);
+
+------------------------------------------------------------------
+-- Tests: psi_all internal helpers
+------------------------------------------------------------------
+INSERT INTO _results
+SELECT 'all-helpers: five internal macros exist',
+       coalesce(count(DISTINCT function_name) = 5, false),
+       'found ' || count(DISTINCT function_name)::VARCHAR
+FROM duckdb_functions()
+WHERE function_name IN ('_psi_kind', '_psi_to_double', '_psi_contrib',
+                        '_psi_all_long', '_psi_cols');
+
+INSERT INTO _results
+SELECT 'all-helpers: _psi_kind type mapping',
+       coalesce(_psi_kind('DOUBLE') = 'continuous'
+            AND _psi_kind('INTEGER') = 'continuous'
+            AND _psi_kind('DECIMAL(10,2)') = 'continuous'
+            AND _psi_kind('DATE') = 'continuous'
+            AND _psi_kind('TIMESTAMP') = 'continuous'
+            AND _psi_kind('TIMESTAMP WITH TIME ZONE') = 'continuous'
+            AND _psi_kind('VARCHAR') = 'categorical'
+            AND _psi_kind('BOOLEAN') = 'categorical'
+            AND _psi_kind('UUID') = 'categorical', false),
+       'mapping checked';
+
+INSERT INTO _results
+SELECT 'all-helpers: _psi_to_double numeric, temporal, sentinel',
+       coalesce(abs(_psi_to_double('0.9') - 0.9) < 1e-12
+            AND _psi_to_double('(NULL)') IS NULL
+            AND _psi_to_double('abc') IS NULL
+            AND isnan(_psi_to_double('nan'))
+            AND _psi_to_double('2024-01-06') - _psi_to_double('2024-01-05') = 86400.0
+            AND _psi_to_double('2024-01-05 12:30:00') - _psi_to_double('2024-01-05 12:00:00') = 1800.0, false),
+       'conversions checked';
+
+INSERT INTO _results
+SELECT 'all-helpers: _psi_all_long shape and NULL sentinel',
+       coalesce(count(*) = 1800     -- 9 columns x 200 rows
+            AND count(*) FILTER (WHERE col = 'seg' AND v = '(NULL)') = 50, false),
+       'rows=' || count(*)::VARCHAR
+FROM _psi_all_long('sweep_ref');
+
+INSERT INTO _results
+SELECT 'all-helpers: _psi_cols kinds for mixed table',
+       coalesce(count(*) = 9
+            AND bool_and(CASE WHEN col IN ('id', 'score', 'amount', 'ts', 'd', 'mix', 'only_ref')
+                              THEN kind = 'continuous'
+                              ELSE kind = 'categorical' END), false),
+       string_agg(col || ':' || kind, ', ' ORDER BY col)
+FROM _psi_cols('sweep_ref');
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail
