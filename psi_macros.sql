@@ -467,8 +467,14 @@ SELECT k.col AS "column",
        s.psi,
        psi_interpret(s.psi) AS interpretation,
        -- one-sided columns are never scored, so a group count would be
-       -- misleading (it reflects only the present side)
-       CASE WHEN k.status IN ('ref only', 'cur only') THEN NULL ELSE s.groups END AS groups,
+       -- misleading (it reflects only the present side); NULL groups means
+       -- exactly that. A two-sided categorical column with both tables
+       -- empty has no summary row at all (its GROUP BY sees zero long-form
+       -- rows), so coalesce to 0 observed categories -- matching psi_cat,
+       -- while the continuous branch keeps its catalog scaffold row
+       -- (groups = 1, matching psi bins_used).
+       CASE WHEN k.status IN ('ref only', 'cur only') THEN NULL
+            ELSE coalesce(s.groups, 0) END AS groups,
        coalesce(s.ref_rows, 0) AS ref_rows,
        coalesce(s.cur_rows, 0) AS cur_rows
 FROM cols k LEFT JOIN summaries s ON k.col = s.col

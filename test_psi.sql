@@ -583,9 +583,21 @@ INSERT INTO _results
 SELECT 'all: both empty is insufficient data',
        coalesce(count(*) = 1
             AND bool_and(psi IS NULL AND interpretation = 'insufficient data'
-                     AND ref_rows = 0 AND cur_rows = 0), false),
+                     AND groups = 0 AND ref_rows = 0 AND cur_rows = 0), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_all('cat_empty', 'cat_empty');
+
+-- groups mirrors the single-column macros in the empty-both corner:
+-- categorical = 0 observed categories (psi_cat), continuous = the one
+-- open scaffold bin (psi bins_used). NULL groups stays reserved for
+-- one-sided columns.
+INSERT INTO _results
+SELECT 'all: cont both empty keeps scaffold bin',
+       coalesce(count(*) = 1
+            AND bool_and(psi IS NULL AND status = 'ok'
+                     AND groups = 1 AND ref_rows = 0 AND cur_rows = 0), false),
+       'rows=' || count(*)::VARCHAR
+FROM psi_all('cont_empty', 'cont_empty');
 
 INSERT INTO _results
 SELECT 'all: bins=1 single-bin identity',
