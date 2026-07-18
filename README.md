@@ -143,9 +143,10 @@ to every column.
   continuous rows can differ from a per-column `psi()` call within
   approx-quantile sketch noise (cut points are already not bit-exact).
   For a single column, `psi()`/`psi_cat()` are also the faster path.
-- **Sweep table names**: bare names and `'schema.table'` are matched
-  case-insensitively in the catalog; a bare name matching tables in more
-  than one schema raises an error instead of guessing.
+- **Sweep table names**: bare names, `'schema.table'`, and
+  `'database.schema.table'` are matched case-insensitively in the
+  catalog; an ambiguous name raises an error (qualify further) instead
+  of guessing.
 - **Sweep reserved name**: DuckDB's `query_table` resolves CTE names in
   scope — even schema-qualified ones — so `psi_all` hoists its table scans
   ahead of its internal CTEs and reserves a single name: a table named

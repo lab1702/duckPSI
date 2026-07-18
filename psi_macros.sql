@@ -256,14 +256,16 @@ WITH matches AS (
     SELECT database_name, schema_name, table_name, column_name, data_type
     FROM duckdb_columns()
     WHERE NOT "internal"
-      AND CASE WHEN contains(tbl, '.')
+      AND CASE WHEN len(string_split(tbl, '.')) = 3
+               THEN lower(database_name || '.' || schema_name || '.' || table_name) = lower(tbl)
+               WHEN contains(tbl, '.')
                THEN lower(schema_name || '.' || table_name) = lower(tbl)
                ELSE lower(table_name) = lower(tbl) END
 ),
 guard AS (
     SELECT CASE
         WHEN count(DISTINCT database_name || '.' || schema_name || '.' || table_name) > 1
-          THEN error('psi_all: table name ''' || tbl || ''' matches more than one table; qualify as schema.table')
+          THEN error('psi_all: table name ''' || tbl || ''' matches more than one table; qualify as schema.table or database.schema.table')
         WHEN count(*) = 0
           THEN error('psi_all: table ''' || tbl || ''' not found')
         ELSE true END AS ok
@@ -307,7 +309,7 @@ _psi_all_ref_long AS (
 _psi_all_cur_long AS (
     SELECT col, v FROM _psi_all_long(
         CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_all_ref_long'
-             THEN error('psi_all: the table name ''_psi_all_ref_long'' is reserved by psi_all; rename that table to sweep it')
+             THEN error('psi_all: the table name ''_psi_all_ref_long'' is reserved by psi_all; rename the table')
              ELSE cur_tbl END)
 ),
 cols AS (
@@ -323,7 +325,8 @@ cols AS (
     FROM _psi_cols(ref_tbl) r
     FULL OUTER JOIN _psi_cols(cur_tbl) c ON r.col = c.col
     -- the ::VARCHAR[] cast also types the [] default (untyped otherwise)
-    WHERE NOT list_contains(exclude::VARCHAR[], coalesce(r.col, c.col))
+    WHERE CASE WHEN bins < 1 THEN error('bins must be >= 1') ELSE true END
+      AND NOT list_contains(exclude::VARCHAR[], coalesce(r.col, c.col))
 ),
 -- ---- categorical branch: psi_cat_detail's math, partitioned by col ----
 cat_ref AS (
@@ -382,12 +385,12 @@ cont_cuts AS (
     FROM cont_ref_vals GROUP BY col
 ),
 -- The scaffold comes from the catalog (cols), not from observed data, so
--- every continuous column gets rows even when one side is empty; the
--- bins guard lives here so it fires whenever a continuous column exists.
+-- every continuous column gets rows even when one side is empty. (bins
+-- is validated in the cols CTE, so it errors for any sweep, even one
+-- with no continuous columns.)
 cont_scaffold AS (
     SELECT k.col,
-           unnest(generate_series(1, CASE WHEN bins < 1 THEN error('bins must be >= 1')
-                                          ELSE coalesce(len(c.cuts), 0) + 1 END)) AS bin
+           unnest(generate_series(1, coalesce(len(c.cuts), 0) + 1)) AS bin
     FROM cols k LEFT JOIN cont_cuts c ON k.col = c.col
     WHERE k.kind = 'continuous'
 ),

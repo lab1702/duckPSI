@@ -603,6 +603,18 @@ SELECT 'all: no shared columns gives status rows only',
        'rows=' || count(*)::VARCHAR
 FROM psi_all('cat_ref', 'cont_ref');
 
+INSERT INTO _results
+SELECT 'all: fully qualified table names work',
+       coalesce(bool_and(abs(psi) < 1e-12 AND status = 'ok'), false),
+       'db-qualified checked'
+FROM psi_all('memory.main.cont_ref', 'memory.main.cont_ref');
+
+INSERT INTO _results
+SELECT 'all: views sweep like tables',
+       coalesce(bool_and(kind = 'continuous' AND status = 'ok' AND abs(psi) < 1e-12), false),
+       'view checked'
+FROM psi_all('sweep_ref_ts', 'sweep_ref_ts');
+
 CREATE SCHEMA IF NOT EXISTS sweep_s1;
 CREATE OR REPLACE TABLE sweep_s1.qual AS SELECT range::DOUBLE AS x FROM range(50);
 INSERT INTO _results
