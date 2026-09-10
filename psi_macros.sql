@@ -1,6 +1,17 @@
 -- psi_macros.sql — Population Stability Index (PSI) as pure DuckDB SQL table macros.
 -- Requires DuckDB >= 1.3 (Python-style lambdas). Load with:  .read psi_macros.sql
 
+-- Split a qualified identifier without treating dots inside double quotes as
+-- separators. Decode doubled quotes and preserve quoted whitespace. query_table
+-- remains responsible for rejecting invalid SQL identifiers.
+CREATE OR REPLACE MACRO _psi_name_parts(tbl) AS
+  list_transform(
+    list_filter(regexp_extract_all(tbl, '"(?:""|[^"])*"|[^."]+'),
+                lambda part: trim(part) <> ''),
+    lambda part: CASE WHEN starts_with(trim(part), '"')
+                     THEN replace(substr(trim(part), 2, len(trim(part)) - 2), '""', '"')
+                     ELSE trim(part) END);
+
 -- ==================================================================
 -- psi_cat_detail(ref_tbl, cur_tbl, col, eps := 1e-4)
 -- Categorical PSI detail: one row per distinct value across BOTH
@@ -30,7 +41,7 @@ _psi_cat_ref_counts AS (
 _psi_cat_cur_counts AS (
     SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
-        CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_cat_ref_counts'
+        CASE WHEN lower(_psi_name_parts(cur_tbl)[-1]) = '_psi_cat_ref_counts'
              THEN error('psi_cat_detail: the table name ''_psi_cat_ref_counts'' is reserved by psi_cat_detail; rename that table to compare it')
              ELSE cur_tbl END))
     GROUP BY 1
@@ -87,7 +98,7 @@ _psi_ref_vals AS (
 _psi_cur_vals AS (
     SELECT v::DOUBLE AS v
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
-        CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_ref_vals'
+        CASE WHEN lower(_psi_name_parts(cur_tbl)[-1]) = '_psi_ref_vals'
              THEN error('psi_detail: the table name ''_psi_ref_vals'' is reserved by psi_detail; rename that table to compare it')
              ELSE cur_tbl END))
     WHERE v IS NOT NULL
@@ -253,8 +264,11 @@ CREATE OR REPLACE MACRO _psi_kind(dt) AS
 -- The string fallback also honors explicit offsets. Failed conversions and
 -- NULLs remain NULL, reproducing the continuous NULL-exclusion rule.
 CREATE OR REPLACE MACRO _psi_to_double(v) AS
-  CASE WHEN typeof(v) IN ('DATE', 'TIMESTAMP')
-       THEN epoch(try_cast(v AS TIMESTAMP))
+  CASE WHEN typeof(v) IN ('DATE', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE')
+            AND v::VARCHAR IN ('infinity', '-infinity')
+       THEN CASE WHEN v::VARCHAR = 'infinity' THEN 'inf'::DOUBLE ELSE '-inf'::DOUBLE END
+       WHEN typeof(v) = 'DATE' THEN epoch(try_cast(v AS DATE))
+       WHEN typeof(v) = 'TIMESTAMP' THEN epoch(try_cast(v AS TIMESTAMP))
        ELSE coalesce(try_cast(v AS DOUBLE), epoch(try_cast(v AS TIMESTAMPTZ))) END;
 
 -- The eps-floored PSI contribution term (same formula the single-column
@@ -263,19 +277,20 @@ CREATE OR REPLACE MACRO _psi_contrib(cur_pct, ref_pct, eps) AS
   (greatest(cur_pct, eps) - greatest(ref_pct, eps))
     * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps));
 
--- Reshapes a table to (col, v, vd), one row per cell. Each column becomes
--- the same STRUCT type before UNPIVOT, retaining its categorical spelling
--- in v and its native continuous value in vd. The non-NULL struct and the
--- '(NULL)' sentinel preserve NULL cells for categorical comparisons.
-CREATE OR REPLACE MACRO _psi_all_long(tbl) AS TABLE
-  SELECT col, cell.v AS v, cell.vd AS vd
-  FROM (UNPIVOT (
+-- Keep columns separate while converting their cells to a common STRUCT
+-- shape. Each column still retains its own VARCHAR collation at this stage.
+-- A missing column in UNION ALL BY NAME becomes a NULL struct; an observed
+-- SQL NULL instead has a non-NULL struct containing the '(NULL)' category.
+CREATE OR REPLACE MACRO _psi_all_cells(tbl, population) AS TABLE
       SELECT struct_pack(
           v := coalesce(COLUMNS(*)::VARCHAR, '(NULL)'),
           vd := CASE WHEN _psi_kind(typeof(COLUMNS(*))) = 'continuous'
-                     THEN _psi_to_double(COLUMNS(*)) ELSE NULL::DOUBLE END)
-      FROM query_table(tbl)
-  ) ON COLUMNS(*) INTO NAME col VALUE cell);
+                     THEN _psi_to_double(COLUMNS(*)) ELSE NULL::DOUBLE END,
+          -- Concatenation keeps struct_pack's field alias from replacing the
+          -- source alias seen by alias(). Preserve case across UNION BY NAME.
+          col := alias(COLUMNS(*)) || '',
+          population := population)
+      FROM query_table(tbl);
 
 -- Column catalog for a table or view: (col, kind). Accepts a bare name,
 -- 'schema.table', or 'database.schema.table', matched case-insensitively
@@ -287,15 +302,16 @@ WITH matches AS (
     SELECT database_name, schema_name, table_name, column_name, data_type
     FROM duckdb_columns()
     WHERE NOT "internal"
-      AND CASE WHEN len(string_split(tbl, '.')) = 3
-               THEN lower(database_name || '.' || schema_name || '.' || table_name) = lower(tbl)
-               WHEN contains(tbl, '.')
-               THEN lower(schema_name || '.' || table_name) = lower(tbl)
-               ELSE lower(table_name) = lower(tbl) END
+      AND len(_psi_name_parts(tbl)) BETWEEN 1 AND 3
+      AND lower(table_name) = lower(_psi_name_parts(tbl)[-1])
+      AND (len(_psi_name_parts(tbl)) < 2
+           OR lower(schema_name) = lower(_psi_name_parts(tbl)[-2]))
+      AND (len(_psi_name_parts(tbl)) < 3
+           OR lower(database_name) = lower(_psi_name_parts(tbl)[-3]))
 ),
 guard AS (
     SELECT CASE
-        WHEN count(DISTINCT database_name || '.' || schema_name || '.' || table_name) > 1
+        WHEN count(DISTINCT (database_name, schema_name, table_name)) > 1
           THEN error('psi_all: table name ''' || tbl || ''' matches more than one table; qualify as schema.table or database.schema.table')
         WHEN count(*) = 0
           THEN error('psi_all: table ''' || tbl || ''' not found')
@@ -324,7 +340,7 @@ WHERE g.ok;
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_all(ref_tbl, cur_tbl, bins := 10, eps := 1e-4, exclude := []) AS TABLE
 WITH
--- The long-form scans MUST be the first CTEs in this chain, and no other
+-- The input scans MUST be the first CTEs in this chain, and no other
 -- part of this macro may call query_table: query_table resolves CTE names
 -- in scope (even when the argument is schema-qualified), so a
 -- query_table(cur_tbl) placed after e.g. the cat_ref CTE would silently
@@ -335,13 +351,33 @@ WITH
 -- mis-resolution. The ref-side scan sees no CTEs at all, so any ref name
 -- resolves from the catalog.
 _psi_all_ref_long AS (
-    SELECT col, v, vd FROM _psi_all_long(ref_tbl)
+    SELECT * FROM _psi_all_cells(ref_tbl, 'ref')
 ),
 _psi_all_cur_long AS (
-    SELECT col, v, vd FROM _psi_all_long(
-        CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_all_ref_long'
+    SELECT * FROM _psi_all_cells(
+        CASE WHEN lower(_psi_name_parts(cur_tbl)[-1]) = '_psi_all_ref_long'
              THEN error('psi_all: the table name ''_psi_all_ref_long'' is reserved by psi_all; rename the table')
-             ELSE cur_tbl END)
+             ELSE cur_tbl END, 'cur')
+),
+both_wide AS (
+    SELECT * FROM _psi_all_ref_long
+    UNION ALL BY NAME
+    SELECT * FROM _psi_all_cur_long
+),
+both_long AS (
+    SELECT cell.col AS col, cell.category AS category, cell.vd AS vd, cell.population AS population
+    FROM (UNPIVOT (
+        -- Partition before UNPIVOT: each original column's collation defines
+        -- equality. One canonical BLOB across both populations preserves that
+        -- equivalence after reshape, without leaking collation between columns.
+        SELECT CASE WHEN COLUMNS(*) IS NULL THEN NULL ELSE struct_pack(
+            category := min(encode(struct_extract(COLUMNS(*), 'v')))
+                        OVER (PARTITION BY struct_extract(COLUMNS(*), 'v')),
+            vd := struct_extract(COLUMNS(*), 'vd'),
+            col := struct_extract(COLUMNS(*), 'col'),
+            population := struct_extract(COLUMNS(*), 'population')) END
+        FROM both_wide
+    ) ON COLUMNS(*) INTO NAME col VALUE cell)
 ),
 cols AS (
     SELECT coalesce(r.col, c.col) AS col,
@@ -361,15 +397,15 @@ cols AS (
 ),
 -- ---- categorical branch: psi_cat_detail's math, partitioned by col ----
 cat_ref AS (
-    SELECT l.col, l.v AS category, count(*) AS cnt
-    FROM _psi_all_ref_long l JOIN cols k ON l.col = k.col
-    WHERE k.kind = 'categorical'
+    SELECT l.col, l.category, count(*) AS cnt
+    FROM both_long l JOIN cols k ON l.col = k.col
+    WHERE k.kind = 'categorical' AND l.population = 'ref'
     GROUP BY 1, 2
 ),
 cat_cur AS (
-    SELECT l.col, l.v AS category, count(*) AS cnt
-    FROM _psi_all_cur_long l JOIN cols k ON l.col = k.col
-    WHERE k.kind = 'categorical'
+    SELECT l.col, l.category, count(*) AS cnt
+    FROM both_long l JOIN cols k ON l.col = k.col
+    WHERE k.kind = 'categorical' AND l.population = 'cur'
     GROUP BY 1, 2
 ),
 cat_merged AS (
@@ -398,15 +434,15 @@ cat_summary AS (
 cont_ref_vals AS (
     SELECT col, vd FROM (
         SELECT l.col, l.vd
-        FROM _psi_all_ref_long l JOIN cols k ON l.col = k.col
-        WHERE k.kind = 'continuous'
+        FROM both_long l JOIN cols k ON l.col = k.col
+        WHERE k.kind = 'continuous' AND l.population = 'ref'
     ) WHERE vd IS NOT NULL
 ),
 cont_cur_vals AS (
     SELECT col, vd FROM (
         SELECT l.col, l.vd
-        FROM _psi_all_cur_long l JOIN cols k ON l.col = k.col
-        WHERE k.kind = 'continuous'
+        FROM both_long l JOIN cols k ON l.col = k.col
+        WHERE k.kind = 'continuous' AND l.population = 'cur'
     ) WHERE vd IS NOT NULL
 ),
 cont_cuts AS (

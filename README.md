@@ -148,6 +148,12 @@ to every column.
   continuous (temporal values compared as epoch seconds); everything else is
   categorical. A column that is continuous in one table but not the other is
   analyzed as categorical and flagged `status = 'type mismatch'`.
+- **Temporal range** (`psi_all`): non-NULL temporal infinities map to
+  numeric infinities and remain in the row counts. DATE values retain their
+  full range, including dates outside the TIMESTAMP range.
+- **Categorical collations** (`psi_all`): each column's collation is applied
+  before reshaping, so a case-insensitive column does not change the matching
+  rules of another column. This adds a window partition per column.
 - **Sweep statuses**: columns present in only one table still get a row
   (`psi = NULL`, `status = 'ref only'` / `'cur only'`) so schema drift is
   visible; a missing column never aborts the sweep.
@@ -158,7 +164,8 @@ to every column.
 - **Sweep table names**: bare names, `'schema.table'`, and
   `'database.schema.table'` are matched case-insensitively in the
   catalog; an ambiguous name raises an error (qualify further) instead
-  of guessing.
+  of guessing. Double-quoted components are supported, including embedded
+  dots, such as `'myschema."feature.v1"'`.
 - **Sweep reserved name**: DuckDB's `query_table` resolves CTE names in
   scope — even schema-qualified ones — so `psi_all` hoists its table scans
   ahead of its internal CTEs and reserves a single name: a table named
@@ -170,9 +177,11 @@ to every column.
 
 ```sh
 duckdb -c ".read test_psi.sql"
+sh test_errors.sh
 ```
 
-Prints one PASS/FAIL row per assertion and exits non-zero on any failure.
+The SQL suite prints one PASS/FAIL row per assertion. The shell suite checks
+expected error messages and non-zero exits. Both exit non-zero on failure.
 
 ## License
 

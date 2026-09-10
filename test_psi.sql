@@ -73,7 +73,7 @@ FROM duckdb_functions() WHERE function_name = 'psi_cat_detail';
 
 INSERT INTO _results
 SELECT 'cat_detail: identity has zero contribs',
-       coalesce(bool_and(abs(psi_contrib) < 1e-12) AND count(*) = 3, false),
+       coalesce(bool_and(coalesce(abs(psi_contrib) < 1e-12, false)) AND count(*) = 3, false),
        'rows=' || count(*)::VARCHAR
 FROM psi_cat_detail('cat_ref', 'cat_ref', 'seg');
 
@@ -113,7 +113,7 @@ FROM psi_cat_detail('cat_ref_nulls', 'cat_ref_nulls', 'seg');
 
 INSERT INTO _results
 SELECT 'cat_detail: integer column works',
-       coalesce(count(*) = 3 AND bool_and(abs(psi_contrib) < 1e-12), false),
+       coalesce(count(*) = 3 AND bool_and(coalesce(abs(psi_contrib) < 1e-12, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_cat_detail('cat_int_ref', 'cat_int_ref', 'grp');
 
@@ -183,7 +183,7 @@ FROM psi_cat('cat_empty', 'cat_empty', 'seg');
 ------------------------------------------------------------------
 INSERT INTO _results
 SELECT 'detail: identity zero contribs, 10 bins',
-       coalesce(bool_and(abs(psi_contrib) < 1e-12) AND count(*) = 10, false),
+       coalesce(bool_and(coalesce(abs(psi_contrib) < 1e-12, false)) AND count(*) = 10, false),
        'rows=' || count(*)::VARCHAR
 FROM psi_detail('cont_ref', 'cont_ref', 'score');
 
@@ -205,7 +205,7 @@ FROM psi_detail('cont_ref', 'cont_cur', 'score', bins := 4);
 
 INSERT INTO _results
 SELECT 'detail: bins=4 counts 25s vs 15/25/25/35',
-       coalesce(bool_and(ref_count = 25)
+       coalesce(bool_and(coalesce(ref_count = 25, false))
        AND list(cur_count ORDER BY bin) = [15, 25, 25, 35], false),
        'cur=' || list(cur_count ORDER BY bin)::VARCHAR
 FROM psi_detail('cont_ref', 'cont_cur', 'score', bins := 4);
@@ -232,14 +232,14 @@ INSERT INTO _results
 SELECT 'detail: value equal to cut goes to upper bin',
        coalesce(max(CASE WHEN bin = 3 THEN cur_count END) = 1
        AND max(CASE WHEN bin = 2 THEN cur_count END) = 0
-       AND bool_and(isfinite(psi_contrib)), false),
+       AND bool_and(coalesce(isfinite(psi_contrib), false)), false),
        'cur=' || list(cur_count ORDER BY bin)::VARCHAR
 FROM psi_detail('cont_ref', 'cont_edge', 'score', bins := 4);
 
 -- 95 ties at 1.0 → every decile cut is 1.0 → dedup → 1 cut → 2 bins
 INSERT INTO _results
 SELECT 'detail: tied values collapse to 2 bins',
-       coalesce(count(*) = 2 AND bool_and(abs(psi_contrib) < 1e-12), false),
+       coalesce(count(*) = 2 AND bool_and(coalesce(abs(psi_contrib) < 1e-12, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_detail('cont_tied', 'cont_tied', 'score');
 
@@ -253,7 +253,7 @@ SELECT 'detail: NULLs excluded from reference',
 
 INSERT INTO _results
 SELECT 'detail: empty cur keeps scaffold, NULL cur_pct',
-       coalesce(count(*) = 4 AND sum(cur_count) = 0 AND bool_and(cur_pct IS NULL)
+       coalesce(count(*) = 4 AND sum(cur_count) = 0 AND bool_and(coalesce(cur_pct IS NULL, false))
        AND sum(ref_count) = 100, false),
        'rows=' || count(*)::VARCHAR
 FROM psi_detail('cont_ref', 'cont_empty', 'score', bins := 4);
@@ -337,8 +337,8 @@ FROM psi('cont_ref', 'cont_ref', 'score', bins := 1);
 -- (psi_cat / psi) collapse this to 'insufficient data'.
 INSERT INTO _results
 SELECT 'cat_detail: empty cur keeps rows, NULL cur_pct, finite contribs',
-       coalesce(count(*) = 3 AND bool_and(cur_pct IS NULL)
-                AND bool_and(isfinite(psi_contrib)) AND bool_and(cur_count = 0), false),
+       coalesce(count(*) = 3 AND bool_and(coalesce(cur_pct IS NULL, false))
+                AND bool_and(coalesce(isfinite(psi_contrib), false)) AND bool_and(coalesce(cur_count = 0, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_cat_detail('cat_ref', 'cat_empty', 'seg');
 
@@ -378,7 +378,7 @@ SELECT 'all-helpers: five internal macros exist',
        'found ' || count(DISTINCT function_name)::VARCHAR
 FROM duckdb_functions()
 WHERE function_name IN ('_psi_kind', '_psi_to_double', '_psi_contrib',
-                        '_psi_all_long', '_psi_cols');
+                        '_psi_all_cells', '_psi_cols');
 
 INSERT INTO _results
 SELECT 'all-helpers: _psi_kind type mapping',
@@ -404,18 +404,19 @@ SELECT 'all-helpers: _psi_to_double numeric, temporal, sentinel',
        'conversions checked';
 
 INSERT INTO _results
-SELECT 'all-helpers: _psi_all_long shape and NULL sentinel',
+SELECT 'all-helpers: _psi_all_cells shape and NULL sentinel',
        coalesce(count(*) = 1800     -- 9 columns x 200 rows
-            AND count(*) FILTER (WHERE col = 'seg' AND v = '(NULL)') = 50, false),
+            AND count(*) FILTER (WHERE col = 'seg' AND cell.v = '(NULL)') = 50, false),
        'rows=' || count(*)::VARCHAR
-FROM _psi_all_long('sweep_ref');
+FROM (UNPIVOT (SELECT * FROM _psi_all_cells('sweep_ref', 'ref'))
+      ON COLUMNS(*) INTO NAME col VALUE cell);
 
 INSERT INTO _results
 SELECT 'all-helpers: _psi_cols kinds for mixed table',
        coalesce(count(*) = 9
-            AND bool_and(CASE WHEN col IN ('id', 'score', 'amount', 'ts', 'd', 'mix', 'only_ref')
+            AND bool_and(coalesce(CASE WHEN col IN ('id', 'score', 'amount', 'ts', 'd', 'mix', 'only_ref')
                               THEN kind = 'continuous'
-                              ELSE kind = 'categorical' END), false),
+                              ELSE kind = 'categorical' END, false)), false),
        string_agg(col || ':' || kind, ', ' ORDER BY col)
 FROM _psi_cols('sweep_ref');
 
@@ -434,11 +435,11 @@ FROM duckdb_functions() WHERE function_name = 'psi_all';
 INSERT INTO _results
 SELECT 'all: one row per column with correct kinds',
        coalesce(count(*) = 10
-            AND bool_and(CASE WHEN "column" IN ('id', 'score', 'amount', 'ts', 'd')
+            AND bool_and(coalesce(CASE WHEN "column" IN ('id', 'score', 'amount', 'ts', 'd')
                               THEN kind = 'continuous' AND status = 'ok'
                               WHEN "column" IN ('seg', 'flag')
                               THEN kind = 'categorical' AND status = 'ok'
-                              ELSE true END), false),
+                              ELSE true END, false)), false),
        string_agg("column" || ':' || kind || ':' || status, ', ' ORDER BY "column")
 FROM psi_all('sweep_ref', 'sweep_cur');
 
@@ -481,7 +482,7 @@ SELECT 'all: groups and row counts per kind',
        coalesce(
            max(CASE WHEN "column" = 'score' THEN groups END) = 10
        AND max(CASE WHEN "column" = 'seg' THEN groups END) = 4   -- a, b, c, (NULL)
-       AND bool_and(CASE WHEN status = 'ok' THEN ref_rows = 200 AND cur_rows = 180 ELSE true END), false),
+       AND bool_and(coalesce(CASE WHEN status = 'ok' THEN ref_rows = 200 AND cur_rows = 180 ELSE true END, false)), false),
        'groups/rows checked'
 FROM psi_all('sweep_ref', 'sweep_cur');
 
@@ -489,7 +490,7 @@ INSERT INTO _results
 SELECT 'all: sorted by psi desc, nulls last',
        coalesce(
            (SELECT "column" FROM psi_all('sweep_ref', 'sweep_cur') LIMIT 1) = 'ts'
-       AND (SELECT bool_and(psi IS NULL)
+       AND (SELECT bool_and(coalesce(psi IS NULL, false))
             FROM (SELECT psi FROM psi_all('sweep_ref', 'sweep_cur') OFFSET 8)), false),
        'order checked';
 
@@ -519,23 +520,23 @@ CREATE OR REPLACE TABLE nan_sweep_cur AS
 
 INSERT INTO _results
 SELECT 'all: identity sweep is all zero and ok',
-       coalesce(count(*) = 9 AND bool_and(status = 'ok') AND bool_and(abs(psi) < 1e-12), false),
+       coalesce(count(*) = 9 AND bool_and(coalesce(status = 'ok', false)) AND bool_and(coalesce(abs(psi) < 1e-12, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_all('sweep_ref', 'sweep_ref');
 
 INSERT INTO _results
 SELECT 'all: ref-only column flagged, not scored',
-       coalesce(bool_and(status = 'ref only' AND psi IS NULL
+       coalesce(bool_and(coalesce(status = 'ref only' AND psi IS NULL
                      AND interpretation = 'insufficient data'
-                     AND groups IS NULL AND ref_rows = 200 AND cur_rows = 0), false),
+                     AND groups IS NULL AND ref_rows = 200 AND cur_rows = 0, false)), false),
        'only_ref checked'
 FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'only_ref';
 
 INSERT INTO _results
 SELECT 'all: cur-only column flagged, not scored',
-       coalesce(bool_and(status = 'cur only' AND psi IS NULL
+       coalesce(bool_and(coalesce(status = 'cur only' AND psi IS NULL
                      AND interpretation = 'insufficient data'
-                     AND groups IS NULL AND ref_rows = 0 AND cur_rows = 180), false),
+                     AND groups IS NULL AND ref_rows = 0 AND cur_rows = 180, false)), false),
        'only_cur checked'
 FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'only_cur';
 
@@ -543,8 +544,8 @@ FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'only_cur';
 -- analyzed as categorical (5 distinct values), flagged, psi exactly 0.
 INSERT INTO _results
 SELECT 'all: type mismatch analyzed as categorical and flagged',
-       coalesce(bool_and(kind = 'categorical' AND status = 'type mismatch'
-                     AND abs(psi) < 1e-12 AND groups = 5), false),
+       coalesce(bool_and(coalesce(kind = 'categorical' AND status = 'type mismatch'
+                     AND abs(psi) < 1e-12 AND groups = 5, false)), false),
        'mix checked'
 FROM psi_all('sweep_ref', 'sweep_cur') WHERE "column" = 'mix';
 
@@ -574,16 +575,16 @@ SELECT 'all: drifting null rate scored like psi_cat',
 INSERT INTO _results
 SELECT 'all: empty side is insufficient data',
        coalesce(count(*) = 1
-            AND bool_and(psi IS NULL AND interpretation = 'insufficient data'
-                     AND status = 'ok'), false),
+            AND bool_and(coalesce(psi IS NULL AND interpretation = 'insufficient data'
+                     AND status = 'ok', false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_all('cont_empty', 'cont_ref');
 
 INSERT INTO _results
 SELECT 'all: both empty is insufficient data',
        coalesce(count(*) = 1
-            AND bool_and(psi IS NULL AND interpretation = 'insufficient data'
-                     AND groups = 0 AND ref_rows = 0 AND cur_rows = 0), false),
+            AND bool_and(coalesce(psi IS NULL AND interpretation = 'insufficient data'
+                     AND groups = 0 AND ref_rows = 0 AND cur_rows = 0, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_all('cat_empty', 'cat_empty');
 
@@ -594,14 +595,14 @@ FROM psi_all('cat_empty', 'cat_empty');
 INSERT INTO _results
 SELECT 'all: cont both empty keeps scaffold bin',
        coalesce(count(*) = 1
-            AND bool_and(psi IS NULL AND status = 'ok'
-                     AND groups = 1 AND ref_rows = 0 AND cur_rows = 0), false),
+            AND bool_and(coalesce(psi IS NULL AND status = 'ok'
+                     AND groups = 1 AND ref_rows = 0 AND cur_rows = 0, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_all('cont_empty', 'cont_empty');
 
 INSERT INTO _results
 SELECT 'all: bins=1 single-bin identity',
-       coalesce(bool_and(abs(psi) < 1e-12 AND groups = 1), false),
+       coalesce(bool_and(coalesce(abs(psi) < 1e-12 AND groups = 1, false)), false),
        'bins=1 checked'
 FROM psi_all('cont_ref', 'cont_ref', bins := 1);
 
@@ -610,20 +611,20 @@ FROM psi_all('cont_ref', 'cont_ref', bins := 1);
 INSERT INTO _results
 SELECT 'all: no shared columns gives status rows only',
        coalesce(count(*) = 2
-            AND bool_and(psi IS NULL AND groups IS NULL
-                     AND status IN ('ref only', 'cur only')), false),
+            AND bool_and(coalesce(psi IS NULL AND groups IS NULL
+                     AND status IN ('ref only', 'cur only'), false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_all('cat_ref', 'cont_ref');
 
 INSERT INTO _results
 SELECT 'all: fully qualified table names work',
-       coalesce(bool_and(abs(psi) < 1e-12 AND status = 'ok'), false),
+       coalesce(bool_and(coalesce(abs(psi) < 1e-12 AND status = 'ok', false)), false),
        'db-qualified checked'
 FROM psi_all('memory.main.cont_ref', 'memory.main.cont_ref');
 
 INSERT INTO _results
 SELECT 'all: views sweep like tables',
-       coalesce(bool_and(kind = 'continuous' AND status = 'ok' AND abs(psi) < 1e-12), false),
+       coalesce(bool_and(coalesce(kind = 'continuous' AND status = 'ok' AND abs(psi) < 1e-12, false)), false),
        'view checked'
 FROM psi_all('sweep_ref_ts', 'sweep_ref_ts');
 
@@ -631,7 +632,7 @@ CREATE SCHEMA IF NOT EXISTS sweep_s1;
 CREATE OR REPLACE TABLE sweep_s1.qual AS SELECT range::DOUBLE AS x FROM range(50);
 INSERT INTO _results
 SELECT 'all: schema-qualified table names work',
-       coalesce(bool_and(abs(psi) < 1e-12 AND status = 'ok'), false),
+       coalesce(bool_and(coalesce(abs(psi) < 1e-12 AND status = 'ok', false)), false),
        'qualified checked'
 FROM psi_all('sweep_s1.qual', 'sweep_s1.qual');
 -- Tests: user tables named like internal CTEs (query_table shadowing)
@@ -684,7 +685,7 @@ FROM psi_cat('cat_ref', 'ref_counts', 'seg');
 
 INSERT INTO _results
 SELECT 'collide: detail cur table named ref_vals',
-       coalesce(bool_and(ref_count = 25)
+       coalesce(bool_and(coalesce(ref_count = 25, false))
        AND list(cur_count ORDER BY bin) = [15, 25, 25, 35], false),
        'cur=' || list(cur_count ORDER BY bin)::VARCHAR
 FROM psi_detail('cont_ref', 'ref_vals', 'score', bins := 4);
@@ -692,7 +693,7 @@ FROM psi_detail('cont_ref', 'ref_vals', 'score', bins := 4);
 -- ref_vals holds the same data as cont_cur, so this is an identity pair
 INSERT INTO _results
 SELECT 'collide: detail ref table named ref_vals',
-       coalesce(count(*) = 4 AND bool_and(abs(psi_contrib) < 1e-12), false),
+       coalesce(count(*) = 4 AND bool_and(coalesce(abs(psi_contrib) < 1e-12, false)), false),
        'rows=' || count(*)::VARCHAR
 FROM psi_detail('ref_vals', 'cont_cur', 'score', bins := 4);
 
@@ -769,6 +770,111 @@ SELECT 'all-helpers: native temporal epochs preserve timezone semantics',
              = epoch(TIMESTAMPTZ '2024-11-03 01:30:00-05'), false),
        'DATE, TIMESTAMP, and both repeated-hour offsets';
 RESET TimeZone;
+
+------------------------------------------------------------------
+-- Tests: quoted identifiers, temporal ranges, and NULL assertions
+------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS "sweep.quoted";
+CREATE OR REPLACE TABLE "sweep.quoted"."feature.v1" AS SELECT 1::DOUBLE AS x;
+CREATE OR REPLACE TABLE "sweep.quoted"."a""b" AS SELECT 2::DOUBLE AS x;
+CREATE OR REPLACE TABLE "a._psi_ref_vals" AS SELECT 1::DOUBLE AS x;
+
+INSERT INTO _results
+SELECT 'all: quoted table and schema names preserve embedded dots',
+       coalesce(count(*) = 1 AND bool_and(coalesce(psi = 0 AND ref_rows = 1 AND cur_rows = 1, false)), false),
+       'fully qualified quoted identifier'
+FROM psi_all('"memory"."sweep.quoted"."feature.v1"', '"sweep.quoted"."feature.v1"');
+
+INSERT INTO _results
+SELECT 'all-helpers: escaped identifier quotes match the catalog',
+       coalesce(count(*) = 1 AND bool_and(coalesce(col = 'x' AND kind = 'continuous', false)), false),
+       'embedded double quote'
+FROM _psi_cols('"sweep.quoted"."a""b"');
+
+INSERT INTO _results
+SELECT 'collide: quoted dotted table suffix is not a reserved name',
+       coalesce(psi = 0 AND ref_rows = 1 AND cur_rows = 1, false),
+       'quoted dot is part of the table name'
+FROM psi('"a._psi_ref_vals"', '"a._psi_ref_vals"', 'x');
+
+CREATE OR REPLACE TABLE sweep_inf_ref AS
+    SELECT d, d::TIMESTAMP AS t, d::TIMESTAMPTZ AS z FROM (
+        SELECT DATE '2024-01-01' AS d FROM range(50)
+        UNION ALL SELECT DATE '2024-01-10' FROM range(50));
+CREATE OR REPLACE TABLE sweep_inf_cur AS
+    SELECT * FROM sweep_inf_ref
+    UNION ALL SELECT DATE 'infinity', TIMESTAMP 'infinity', TIMESTAMPTZ 'infinity' FROM range(100);
+
+INSERT INTO _results
+SELECT 'all: temporal infinities contribute drift and row counts',
+       coalesce(count(*) = 3 AND bool_and(coalesce(
+           ref_rows = 100 AND cur_rows = 200
+           AND abs(psi - 0.2746530721670274) < 1e-12, false)), false),
+       'DATE, TIMESTAMP, and TIMESTAMPTZ'
+FROM psi_all('sweep_inf_ref', 'sweep_inf_cur', bins := 2);
+
+CREATE OR REPLACE TABLE sweep_wide_date AS SELECT DATE '1000000-01-01' AS d;
+INSERT INTO _results
+SELECT 'all: wide-range non-NULL DATE is retained',
+       coalesce(psi = 0 AND ref_rows = 1 AND cur_rows = 1, false),
+       'date beyond TIMESTAMP range'
+FROM psi_all('sweep_wide_date', 'sweep_wide_date');
+
+INSERT INTO _results
+SELECT 'all-helpers: both temporal infinity signs become numeric infinity',
+       coalesce(_psi_to_double(DATE 'infinity') = 'inf'::DOUBLE
+            AND _psi_to_double(DATE '-infinity') = '-inf'::DOUBLE
+            AND _psi_to_double(TIMESTAMP '-infinity') = '-inf'::DOUBLE
+            AND _psi_to_double(TIMESTAMPTZ '-infinity') = '-inf'::DOUBLE, false),
+       'non-NULL infinities retained';
+
+INSERT INTO _results
+SELECT 'harness: a NULL row predicate fails an aggregate assertion',
+       coalesce(NOT bool_and(coalesce(abs(psi) < 1e-12, false)), false),
+       'one NULL among eight zero values'
+FROM (SELECT CASE WHEN i = 1 THEN NULL::DOUBLE ELSE 0::DOUBLE END AS psi FROM range(9) t(i));
+
+------------------------------------------------------------------
+-- Tests: each categorical column retains its own collation
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE sweep_coll_ref (
+    plain VARCHAR, ci VARCHAR COLLATE nocase, accent VARCHAR COLLATE noaccent,
+    both_rules VARCHAR COLLATE nocase.noaccent);
+CREATE OR REPLACE TABLE sweep_coll_cur (
+    plain VARCHAR, ci VARCHAR COLLATE nocase, accent VARCHAR COLLATE noaccent,
+    both_rules VARCHAR COLLATE nocase.noaccent);
+INSERT INTO sweep_coll_ref VALUES ('A', 'A', 'á', 'Á');
+INSERT INTO sweep_coll_cur VALUES ('a', 'a', 'a', 'a');
+
+INSERT INTO _results
+SELECT 'all: mixed column collations preserve categorical equality',
+       coalesce(count(*) = 4 AND bool_and(coalesce(
+           CASE WHEN "column" = 'plain' THEN psi > 18 AND groups = 2
+                ELSE psi = 0 AND groups = 1 END
+           AND ref_rows = 1 AND cur_rows = 1, false)), false),
+       'binary, nocase, noaccent, and combined collations'
+FROM psi_all('sweep_coll_ref', 'sweep_coll_cur');
+
+INSERT INTO _results
+SELECT 'all: excluded collated columns cannot change another column',
+       coalesce(count(*) = 1 AND bool_and(coalesce(
+           abs(psi - (SELECT psi FROM psi_cat('sweep_coll_ref', 'sweep_coll_cur', 'plain'))) < 1e-12,
+           false)), false),
+       'plain comparison agrees with psi_cat'
+FROM psi_all('sweep_coll_ref', 'sweep_coll_cur', exclude := ['ci', 'accent', 'both_rules']);
+
+CREATE OR REPLACE TABLE sweep_case_ref (Score INT);
+CREATE OR REPLACE TABLE sweep_case_cur (score INT);
+INSERT INTO sweep_case_ref VALUES (1);
+INSERT INTO sweep_case_cur VALUES (2), (3);
+INSERT INTO _results
+SELECT 'all: column case differences retain one-sided row counts',
+       coalesce(count(*) = 2 AND bool_and(coalesce(
+           CASE WHEN "column" = 'Score' THEN status = 'ref only' AND ref_rows = 1 AND cur_rows = 0
+                WHEN "column" = 'score' THEN status = 'cur only' AND ref_rows = 0 AND cur_rows = 2
+                ELSE false END, false)), false),
+       'original names survive the combined reshape'
+FROM psi_all('sweep_case_ref', 'sweep_case_cur');
 
 ------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
