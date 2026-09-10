@@ -60,6 +60,10 @@ Columns are analyzed by their declared type: numeric and temporal types
 (DATE/TIMESTAMP/TIMESTAMPTZ, compared on the epoch axis) get quantile-binned
 continuous PSI; everything else is categorical. Drill into a drifting column
 with `psi_detail` / `psi_cat_detail`.
+Numeric values are converted directly to DOUBLE. DATE/TIMESTAMP values use
+timezone-free epochs, while TIMESTAMPTZ values preserve their UTC instants.
+For temporal drill-downs, create views selecting `epoch(column)` and pass
+those views to `psi_detail`.
 
 Views work anywhere a table name is accepted, so any query can be PSI'd:
 

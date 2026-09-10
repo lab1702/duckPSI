@@ -247,14 +247,15 @@ CREATE OR REPLACE MACRO _psi_kind(dt) AS
          OR dt LIKE 'DECIMAL%'
        THEN 'continuous' ELSE 'categorical' END;
 
--- Long-format VARCHAR cell -> DOUBLE. The TIMESTAMPTZ (not TIMESTAMP)
--- cast is deliberate: it parses DATE / TIMESTAMP / TIMESTAMPTZ strings
--- alike AND honors explicit UTC offsets, which a TIMESTAMP cast would
--- silently drop (skewing epochs across DST-mixed data). Non-numeric,
--- non-temporal strings -- including the '(NULL)' sentinel -- yield NULL,
--- which reproduces the continuous NULL-exclusion rule.
+-- Native cell -> DOUBLE, before the long-format reshape erases its type.
+-- Promote FLOAT directly to DOUBLE to preserve its binary value. DATE and
+-- TIMESTAMP use timezone-free epochs; TIMESTAMPTZ retains its UTC instant.
+-- The string fallback also honors explicit offsets. Failed conversions and
+-- NULLs remain NULL, reproducing the continuous NULL-exclusion rule.
 CREATE OR REPLACE MACRO _psi_to_double(v) AS
-  coalesce(try_cast(v AS DOUBLE), epoch(try_cast(v AS TIMESTAMPTZ)));
+  CASE WHEN typeof(v) IN ('DATE', 'TIMESTAMP')
+       THEN epoch(try_cast(v AS TIMESTAMP))
+       ELSE coalesce(try_cast(v AS DOUBLE), epoch(try_cast(v AS TIMESTAMPTZ))) END;
 
 -- The eps-floored PSI contribution term (same formula the single-column
 -- macros inline).
@@ -262,14 +263,19 @@ CREATE OR REPLACE MACRO _psi_contrib(cur_pct, ref_pct, eps) AS
   (greatest(cur_pct, eps) - greatest(ref_pct, eps))
     * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps));
 
--- Reshapes a table to (col, v) long form, one row per cell. The
--- coalesce sentinel is load-bearing: UNPIVOT drops NULL cells, so NULLs
--- are smuggled through as '(NULL)' -- which doubles as the categorical
--- NULL category. The VARCHAR round trip is exact for DOUBLE (DuckDB
--- prints shortest-round-trip floats).
+-- Reshapes a table to (col, v, vd), one row per cell. Each column becomes
+-- the same STRUCT type before UNPIVOT, retaining its categorical spelling
+-- in v and its native continuous value in vd. The non-NULL struct and the
+-- '(NULL)' sentinel preserve NULL cells for categorical comparisons.
 CREATE OR REPLACE MACRO _psi_all_long(tbl) AS TABLE
-  UNPIVOT (SELECT coalesce(COLUMNS(*)::VARCHAR, '(NULL)') FROM query_table(tbl))
-  ON COLUMNS(*) INTO NAME col VALUE v;
+  SELECT col, cell.v AS v, cell.vd AS vd
+  FROM (UNPIVOT (
+      SELECT struct_pack(
+          v := coalesce(COLUMNS(*)::VARCHAR, '(NULL)'),
+          vd := CASE WHEN _psi_kind(typeof(COLUMNS(*))) = 'continuous'
+                     THEN _psi_to_double(COLUMNS(*)) ELSE NULL::DOUBLE END)
+      FROM query_table(tbl)
+  ) ON COLUMNS(*) INTO NAME col VALUE cell);
 
 -- Column catalog for a table or view: (col, kind). Accepts a bare name,
 -- 'schema.table', or 'database.schema.table', matched case-insensitively
@@ -329,10 +335,10 @@ WITH
 -- mis-resolution. The ref-side scan sees no CTEs at all, so any ref name
 -- resolves from the catalog.
 _psi_all_ref_long AS (
-    SELECT col, v FROM _psi_all_long(ref_tbl)
+    SELECT col, v, vd FROM _psi_all_long(ref_tbl)
 ),
 _psi_all_cur_long AS (
-    SELECT col, v FROM _psi_all_long(
+    SELECT col, v, vd FROM _psi_all_long(
         CASE WHEN string_split(lower(cur_tbl), '.')[-1] = '_psi_all_ref_long'
              THEN error('psi_all: the table name ''_psi_all_ref_long'' is reserved by psi_all; rename the table')
              ELSE cur_tbl END)
@@ -391,14 +397,14 @@ cat_summary AS (
 -- ---- continuous branch: psi_detail's math, partitioned by col ----
 cont_ref_vals AS (
     SELECT col, vd FROM (
-        SELECT l.col, _psi_to_double(l.v) AS vd
+        SELECT l.col, l.vd
         FROM _psi_all_ref_long l JOIN cols k ON l.col = k.col
         WHERE k.kind = 'continuous'
     ) WHERE vd IS NOT NULL
 ),
 cont_cur_vals AS (
     SELECT col, vd FROM (
-        SELECT l.col, _psi_to_double(l.v) AS vd
+        SELECT l.col, l.vd
         FROM _psi_all_cur_long l JOIN cols k ON l.col = k.col
         WHERE k.kind = 'continuous'
     ) WHERE vd IS NOT NULL

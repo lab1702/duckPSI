@@ -714,6 +714,63 @@ SELECT 'collide: table named cut_points as ref and cur',
        'both directions';
 
 ------------------------------------------------------------------
+-- Tests: continuous sweep values preserve their native type semantics
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE sweep_float_ref AS
+    SELECT 0.7::FLOAT AS x FROM range(100);
+CREATE OR REPLACE TABLE sweep_float_cur AS
+    SELECT x::DOUBLE AS x FROM sweep_float_ref;
+CREATE OR REPLACE TABLE sweep_float_cat AS
+    SELECT x::VARCHAR AS x FROM sweep_float_ref;
+
+INSERT INTO _results
+SELECT 'all: FLOAT promotion to DOUBLE preserves zero drift',
+       coalesce(
+           (SELECT psi = 0 AND ref_rows = 100 AND cur_rows = 100
+            FROM psi_all('sweep_float_ref', 'sweep_float_cur'))
+       AND (SELECT psi = 0 FROM psi_all('sweep_float_cur', 'sweep_float_ref'))
+       AND (SELECT psi = 0 FROM psi('sweep_float_ref', 'sweep_float_cur', 'x')), false),
+       'both directions';
+
+INSERT INTO _results
+SELECT 'all: FLOAT categorical mismatch preserves VARCHAR categories',
+       coalesce(
+           (SELECT psi = 0 AND status = 'type mismatch' AND groups = 1
+            FROM psi_all('sweep_float_ref', 'sweep_float_cat'))
+       AND (SELECT psi = 0 FROM psi_cat('sweep_float_ref', 'sweep_float_cat', 'x')), false),
+       'categorical spelling preserved';
+
+SET TimeZone = 'America/New_York';
+CREATE OR REPLACE TABLE sweep_dst_ref AS
+    SELECT TIMESTAMP '2024-03-10 03:30:00' AS x FROM range(100);
+CREATE OR REPLACE TABLE sweep_dst_cur AS
+    SELECT TIMESTAMP '2024-03-10 02:30:00' AS x FROM range(100);
+CREATE OR REPLACE VIEW sweep_dst_epoch_ref AS SELECT epoch(x) AS x FROM sweep_dst_ref;
+CREATE OR REPLACE VIEW sweep_dst_epoch_cur AS SELECT epoch(x) AS x FROM sweep_dst_cur;
+
+INSERT INTO _results
+SELECT 'all: timezone-free timestamps retain drift across DST gap',
+       coalesce(
+           (SELECT psi > 18 FROM psi_all('sweep_dst_ref', 'sweep_dst_cur'))
+       AND abs((SELECT psi FROM psi_all('sweep_dst_ref', 'sweep_dst_cur'))
+             - (SELECT psi FROM psi('sweep_dst_epoch_ref', 'sweep_dst_epoch_cur', 'x'))) < 1e-12,
+           false),
+       'compared with native epoch views';
+
+INSERT INTO _results
+SELECT 'all-helpers: native temporal epochs preserve timezone semantics',
+       coalesce(
+           _psi_to_double(DATE '2024-03-10') = epoch(DATE '2024-03-10')
+       AND _psi_to_double(TIMESTAMP '2024-03-10 02:30:00')
+             = epoch(TIMESTAMP '2024-03-10 02:30:00')
+       AND _psi_to_double(TIMESTAMPTZ '2024-11-03 01:30:00-04')
+             = epoch(TIMESTAMPTZ '2024-11-03 01:30:00-04')
+       AND _psi_to_double(TIMESTAMPTZ '2024-11-03 01:30:00-05')
+             = epoch(TIMESTAMPTZ '2024-11-03 01:30:00-05'), false),
+       'DATE, TIMESTAMP, and both repeated-hour offsets';
+RESET TimeZone;
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail
