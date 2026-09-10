@@ -12,10 +12,15 @@ CREATE OR REPLACE MACRO _psi_name_parts(tbl) AS
                      THEN replace(substr(trim(part), 2, len(trim(part)) - 2), '""', '"')
                      ELSE trim(part) END);
 
+-- DuckDB identifiers fold ASCII letters only. BLOB keys also prevent the
+-- session's text collation from treating distinct identifier bytes as equal.
+CREATE OR REPLACE MACRO _psi_identifier_key(name) AS
+  encode(translate(name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'));
+
 -- ==================================================================
 -- psi_cat_detail(ref_tbl, cur_tbl, col, eps := 1e-4)
 -- Categorical PSI detail: one row per distinct value across BOTH
--- populations (full outer join). NULL is its own '(NULL)' category.
+-- populations. NULL is its own '(NULL)' category.
 -- ref_pct / cur_pct are true proportions; only psi_contrib uses the
 -- eps-floored values.
 -- ==================================================================
@@ -30,32 +35,36 @@ WITH
 -- collision into an error instead of a silent mis-resolution. The
 -- ref-side scan sees no CTEs at all, so any ref name resolves from the
 -- catalog.
--- Grouping directly on the casted expression keeps each input single-
--- referenced, so DuckDB streams the base scans instead of materializing
--- a per-row VARCHAR copy of each table.
+-- Each input is referenced once and streams through UNION into one grouping.
+-- Raw values must reach that grouping: pre-grouping either input under its
+-- own collation could discard distinctions needed by the common collation.
 _psi_cat_ref_counts AS (
-    SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
+    SELECT coalesce(v::VARCHAR, '(NULL)') AS v
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
-    GROUP BY 1
 ),
 _psi_cat_cur_counts AS (
-    SELECT coalesce(v::VARCHAR, '(NULL)') AS v, count(*) AS cnt
+    SELECT coalesce(v::VARCHAR, '(NULL)') AS v
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
-        CASE WHEN lower(_psi_name_parts(cur_tbl)[-1]) = '_psi_cat_ref_counts'
+        CASE WHEN _psi_identifier_key(_psi_name_parts(cur_tbl)[-1]) = encode('_psi_cat_ref_counts')
              THEN error('psi_cat_detail: the table name ''_psi_cat_ref_counts'' is reserved by psi_cat_detail; rename that table to compare it')
              ELSE cur_tbl END))
-    GROUP BY 1
 ),
 merged AS (
-    SELECT coalesce(r.v, u.v) AS category,
-           coalesce(r.cnt, 0)::BIGINT AS ref_count,
-           coalesce(u.cnt, 0)::BIGINT AS cur_count
-    FROM _psi_cat_ref_counts r
-    FULL OUTER JOIN _psi_cat_cur_counts u ON r.v = u.v
+    -- UNION resolves a common collation before the final grouping. Joining
+    -- separately grouped inputs could match several groups on one side to
+    -- one on the other and duplicate counts when their collations differ.
+    SELECT v AS category, sum(ref_count)::BIGINT AS ref_count,
+           sum(cur_count)::BIGINT AS cur_count
+    FROM (
+        SELECT v, 1::BIGINT AS ref_count, 0::BIGINT AS cur_count FROM _psi_cat_ref_counts
+        UNION ALL
+        SELECT v, 0::BIGINT AS ref_count, 1::BIGINT AS cur_count FROM _psi_cat_cur_counts
+    )
+    GROUP BY v
 ),
 pcts AS (
-    -- the window sums equal count(*) of each input: the full outer join
-    -- preserves every per-category count from both sides
+    -- the window sums equal count(*) of each input: the union preserves
+    -- every per-category count from both sides
     SELECT category, ref_count, cur_count,
            ref_count / nullif(sum(ref_count) OVER (), 0)::DOUBLE AS ref_pct,
            cur_count / nullif(sum(cur_count) OVER (), 0)::DOUBLE AS cur_pct
@@ -98,7 +107,7 @@ _psi_ref_vals AS (
 _psi_cur_vals AS (
     SELECT v::DOUBLE AS v
     FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
-        CASE WHEN lower(_psi_name_parts(cur_tbl)[-1]) = '_psi_ref_vals'
+        CASE WHEN _psi_identifier_key(_psi_name_parts(cur_tbl)[-1]) = encode('_psi_ref_vals')
              THEN error('psi_detail: the table name ''_psi_ref_vals'' is reserved by psi_detail; rename that table to compare it')
              ELSE cur_tbl END))
     WHERE v IS NOT NULL
@@ -288,7 +297,7 @@ CREATE OR REPLACE MACRO _psi_all_cells(tbl, population) AS TABLE
                      THEN _psi_to_double(COLUMNS(*)) ELSE NULL::DOUBLE END,
           -- Concatenation keeps struct_pack's field alias from replacing the
           -- source alias seen by alias(). Preserve case across UNION BY NAME.
-          col := alias(COLUMNS(*)) || '',
+          col := encode(alias(COLUMNS(*)) || ''),
           population := population)
       FROM query_table(tbl);
 
@@ -303,15 +312,15 @@ WITH matches AS (
     FROM duckdb_columns()
     WHERE NOT "internal"
       AND len(_psi_name_parts(tbl)) BETWEEN 1 AND 3
-      AND lower(table_name) = lower(_psi_name_parts(tbl)[-1])
+      AND _psi_identifier_key(table_name) = _psi_identifier_key(_psi_name_parts(tbl)[-1])
       AND (len(_psi_name_parts(tbl)) < 2
-           OR lower(schema_name) = lower(_psi_name_parts(tbl)[-2]))
+           OR _psi_identifier_key(schema_name) = _psi_identifier_key(_psi_name_parts(tbl)[-2]))
       AND (len(_psi_name_parts(tbl)) < 3
-           OR lower(database_name) = lower(_psi_name_parts(tbl)[-3]))
+           OR _psi_identifier_key(database_name) = _psi_identifier_key(_psi_name_parts(tbl)[-3]))
 ),
 guard AS (
     SELECT CASE
-        WHEN count(DISTINCT (database_name, schema_name, table_name)) > 1
+        WHEN count(DISTINCT (encode(database_name), encode(schema_name), encode(table_name))) > 1
           THEN error('psi_all: table name ''' || tbl || ''' matches more than one table; qualify as schema.table or database.schema.table')
         WHEN count(*) = 0
           THEN error('psi_all: table ''' || tbl || ''' not found')
@@ -355,7 +364,7 @@ _psi_all_ref_long AS (
 ),
 _psi_all_cur_long AS (
     SELECT * FROM _psi_all_cells(
-        CASE WHEN lower(_psi_name_parts(cur_tbl)[-1]) = '_psi_all_ref_long'
+        CASE WHEN _psi_identifier_key(_psi_name_parts(cur_tbl)[-1]) = encode('_psi_all_ref_long')
              THEN error('psi_all: the table name ''_psi_all_ref_long'' is reserved by psi_all; rename the table')
              ELSE cur_tbl END, 'cur')
 ),
@@ -380,7 +389,7 @@ both_long AS (
     ) ON COLUMNS(*) INTO NAME col VALUE cell)
 ),
 cols AS (
-    SELECT coalesce(r.col, c.col) AS col,
+    SELECT coalesce(encode(r.col), encode(c.col)) AS col,
            CASE WHEN r.col IS NULL THEN c.kind
                 WHEN c.col IS NULL THEN r.kind
                 WHEN r.kind = 'continuous' AND c.kind = 'continuous' THEN 'continuous'
@@ -390,10 +399,11 @@ cols AS (
                 WHEN r.kind <> c.kind THEN 'type mismatch'
                 ELSE 'ok' END AS status
     FROM _psi_cols(ref_tbl) r
-    FULL OUTER JOIN _psi_cols(cur_tbl) c ON r.col = c.col
+    FULL OUTER JOIN _psi_cols(cur_tbl) c ON encode(r.col) = encode(c.col)
     -- the ::VARCHAR[] cast also types the [] default (untyped otherwise)
     WHERE CASE WHEN bins < 1 THEN error('bins must be >= 1') ELSE true END
-      AND NOT list_contains(exclude::VARCHAR[], coalesce(r.col, c.col))
+      AND NOT list_contains(list_transform(exclude::VARCHAR[], lambda name: encode(name)),
+                            coalesce(encode(r.col), encode(c.col)))
 ),
 -- ---- categorical branch: psi_cat_detail's math, partitioned by col ----
 cat_ref AS (
@@ -503,7 +513,7 @@ summaries AS (
     UNION ALL
     SELECT * FROM cont_summary
 )
-SELECT k.col AS "column",
+SELECT decode(k.col) AS "column",
        k.kind,
        k.status,
        s.psi,

@@ -154,6 +154,8 @@ to every column.
 - **Categorical collations** (`psi_all`): each column's collation is applied
   before reshaping, so a case-insensitive column does not change the matching
   rules of another column. This adds a window partition per column.
+  When the input sides have different collations, categorical macros group
+  both populations using DuckDB's common collation for their union.
 - **Sweep statuses**: columns present in only one table still get a row
   (`psi = NULL`, `status = 'ref only'` / `'cur only'`) so schema drift is
   visible; a missing column never aborts the sweep.
@@ -162,7 +164,8 @@ to every column.
   approx-quantile sketch noise (cut points are already not bit-exact).
   For a single column, `psi()`/`psi_cat()` are also the faster path.
 - **Sweep table names**: bare names, `'schema.table'`, and
-  `'database.schema.table'` are matched case-insensitively in the
+  `'database.schema.table'` are matched using DuckDB's ASCII-only
+  case-insensitive identifier rules in the
   catalog; an ambiguous name raises an error (qualify further) instead
   of guessing. Double-quoted components are supported, including embedded
   dots, such as `'myschema."feature.v1"'`.

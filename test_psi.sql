@@ -877,6 +877,68 @@ SELECT 'all: column case differences retain one-sided row counts',
 FROM psi_all('sweep_case_ref', 'sweep_case_cur');
 
 ------------------------------------------------------------------
+-- Tests: different category collations and exact identifier matching
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE cat_coll_ref(v VARCHAR COLLATE nocase);
+CREATE OR REPLACE TABLE cat_coll_cur(v VARCHAR);
+INSERT INTO cat_coll_ref VALUES ('a'), ('A'), ('b'), ('b');
+INSERT INTO cat_coll_cur SELECT * FROM cat_coll_ref;
+INSERT INTO _results
+SELECT 'cat: different input collations cannot multiply row counts',
+       coalesce(psi = 0 AND categories = 2 AND ref_rows = 4 AND cur_rows = 4, false),
+       'shared case-insensitive equality'
+FROM psi_cat('cat_coll_ref', 'cat_coll_cur', 'v');
+INSERT INTO _results
+SELECT 'cat: different input collations agree with sweep in reverse',
+       coalesce(psi = 0 AND ref_rows = 4 AND cur_rows = 4
+            AND psi = (SELECT psi FROM psi_all('cat_coll_cur', 'cat_coll_ref')), false),
+       'both source orders'
+FROM psi_cat('cat_coll_cur', 'cat_coll_ref', 'v');
+
+CREATE OR REPLACE TABLE cat_coll_accent(v VARCHAR COLLATE noaccent);
+INSERT INTO cat_coll_accent SELECT * FROM cat_coll_ref;
+INSERT INTO _results
+SELECT 'cat: raw values survive distinct explicit input collations',
+       coalesce(psi = 0 AND ref_rows = 4 AND cur_rows = 4
+            AND psi = (SELECT psi FROM psi_all('cat_coll_ref', 'cat_coll_accent')), false),
+       'nocase reference and noaccent current'
+FROM psi_cat('cat_coll_ref', 'cat_coll_accent', 'v');
+
+SET default_collation = 'noaccent';
+CREATE OR REPLACE TABLE sweep_accent_ref(a INT, á INT);
+CREATE OR REPLACE TABLE sweep_accent_cur(a INT, á INT);
+INSERT INTO sweep_accent_ref VALUES (1, 100);
+INSERT INTO sweep_accent_cur VALUES (100, 1);
+INSERT INTO _results
+SELECT 'all: default collation cannot merge different column names',
+       coalesce(count(*) = 2 AND bool_and(coalesce(
+           ref_rows = 1 AND cur_rows = 1 AND groups = 2 AND status = 'ok', false))
+           AND max(CASE WHEN encode("column") = encode('á') THEN psi END) > 18, false),
+       'accented identifiers stay distinct'
+FROM psi_all('sweep_accent_ref', 'sweep_accent_cur', bins := 2);
+INSERT INTO _results
+SELECT 'all: exclusions compare exact column names under noaccent',
+       coalesce(count(*) = 1 AND bool_and(coalesce(encode("column") = encode('á'), false)), false),
+       'excluding a retains á'
+FROM psi_all('sweep_accent_ref', 'sweep_accent_cur', exclude := ['a']);
+RESET default_collation;
+
+CREATE OR REPLACE TABLE "Ä"(v INTEGER);
+CREATE OR REPLACE TABLE "ä"(v INTEGER);
+INSERT INTO "Ä" VALUES (1);
+INSERT INTO "ä" VALUES (2), (3);
+INSERT INTO _results
+SELECT 'all: non-ASCII identifier case stays distinct',
+       coalesce(count(*) = 1 AND bool_and(coalesce(psi = 0 AND ref_rows = 1 AND cur_rows = 1, false)), false),
+       'fully qualified uppercase umlaut'
+FROM psi_all('memory.main.Ä', 'memory.main.Ä');
+INSERT INTO _results
+SELECT 'all: ASCII identifier case still resolves case-insensitively',
+       coalesce(count(*) = 1 AND bool_and(coalesce(psi = 0 AND ref_rows = 2 AND cur_rows = 2, false)), false),
+       'uppercase ASCII database and schema, lowercase umlaut'
+FROM psi_all('MEMORY.MAIN.ä', 'memory.main.ä');
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail
