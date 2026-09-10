@@ -939,6 +939,66 @@ SELECT 'all: ASCII identifier case still resolves case-insensitively',
 FROM psi_all('MEMORY.MAIN.ä', 'memory.main.ä');
 
 ------------------------------------------------------------------
+-- Tests: small positive epsilon does not overflow the log ratio
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE tiny_eps_ref AS SELECT 1::DOUBLE AS x;
+CREATE OR REPLACE TABLE tiny_eps_cur AS SELECT 0::DOUBLE AS x;
+INSERT INTO _results
+SELECT 'cat: subnormal epsilon keeps PSI finite',
+       coalesce(isfinite(psi) AND abs(psi - 1473.6544817819479) < 1e-9, false),
+       'log difference avoids ratio overflow'
+FROM psi_cat('tiny_eps_ref', 'tiny_eps_cur', 'x', eps := 1e-320);
+INSERT INTO _results
+SELECT 'psi: subnormal epsilon keeps PSI finite',
+       coalesce(isfinite(psi) AND abs(psi - 1473.6544817819479) < 1e-9, false),
+       'log difference avoids ratio overflow'
+FROM psi('tiny_eps_ref', 'tiny_eps_cur', 'x', eps := 1e-320);
+INSERT INTO _results
+SELECT 'all: subnormal epsilon keeps PSI finite',
+       coalesce(isfinite(psi) AND abs(psi - 1473.6544817819479) < 1e-9, false),
+       'log difference avoids ratio overflow'
+FROM psi_all('tiny_eps_ref', 'tiny_eps_cur', eps := 1e-320);
+
+------------------------------------------------------------------
+-- Tests: schema-qualified scans ignore enclosing CTEs with the same name
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE caller_ref AS SELECT range::DOUBLE AS v FROM range(100);
+CREATE OR REPLACE TABLE caller_cur AS SELECT * FROM caller_ref;
+INSERT INTO _results
+WITH caller_ref AS (SELECT 1000::DOUBLE AS v), caller_cur AS (SELECT -1000::DOUBLE AS v)
+SELECT 'psi: schema-qualified inputs bypass caller CTEs',
+       coalesce(psi = 0 AND ref_rows = 100 AND cur_rows = 100, false),
+       'both physical tables are identical'
+FROM psi('main.caller_ref', 'main.caller_cur', 'v');
+INSERT INTO _results
+WITH caller_ref AS (SELECT 1000::DOUBLE AS v), caller_cur AS (SELECT -1000::DOUBLE AS v)
+SELECT 'cat: schema-qualified inputs bypass caller CTEs',
+       coalesce(psi = 0 AND categories = 100 AND ref_rows = 100 AND cur_rows = 100, false),
+       'both physical tables are identical'
+FROM psi_cat('main.caller_ref', 'main.caller_cur', 'v');
+INSERT INTO _results
+WITH caller_ref AS (SELECT 1 AS other), caller_cur AS (SELECT 2 AS other)
+SELECT 'all: schema-qualified inputs bypass caller CTE schemas',
+       coalesce(count(*) = 1 AND bool_and(coalesce(
+           psi = 0 AND ref_rows = 100 AND cur_rows = 100 AND "column" = 'v', false)), false),
+       'catalog and scanned schema agree'
+FROM psi_all('main.caller_ref', 'main.caller_cur');
+INSERT INTO _results
+SELECT 'all: embedded identifier quotes scan correctly',
+       coalesce(psi = 0 AND ref_rows = 1 AND cur_rows = 1, false),
+       'native binding preserves escaped double quotes'
+FROM psi_all('"sweep.quoted"."a""b"', '"sweep.quoted"."a""b"');
+
+CREATE OR REPLACE TABLE scan_temp AS SELECT 1::DOUBLE AS v;
+CREATE OR REPLACE TEMP TABLE scan_temp AS SELECT 2::DOUBLE AS v FROM range(2);
+INSERT INTO _results
+WITH scan_temp AS (SELECT 1000::DOUBLE AS v)
+SELECT 'psi: qualified scan preserves temporary table precedence',
+       coalesce(psi = 0 AND ref_rows = 2 AND cur_rows = 2, false),
+       'main resolves the temp table, not the CTE or persistent table'
+FROM psi('main.scan_temp', 'temp.main.scan_temp', 'v');
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail

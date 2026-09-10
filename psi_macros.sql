@@ -2,8 +2,7 @@
 -- Requires DuckDB >= 1.3 (Python-style lambdas). Load with:  .read psi_macros.sql
 
 -- Split a qualified identifier without treating dots inside double quotes as
--- separators. Decode doubled quotes and preserve quoted whitespace. query_table
--- remains responsible for rejecting invalid SQL identifiers.
+-- separators. Decode doubled quotes and preserve quoted whitespace.
 CREATE OR REPLACE MACRO _psi_name_parts(tbl) AS
   list_transform(
     list_filter(regexp_extract_all(tbl, '"(?:""|[^"])*"|[^."]+'),
@@ -17,6 +16,13 @@ CREATE OR REPLACE MACRO _psi_name_parts(tbl) AS
 CREATE OR REPLACE MACRO _psi_identifier_key(name) AS
   encode(translate(name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'));
 
+-- query_table can discard schema qualification while looking up a caller CTE.
+-- Bind a normal SELECT instead, quoting every component so the argument stays
+-- an identifier. Native binding preserves temp tables and the schema search path.
+CREATE OR REPLACE MACRO _psi_table_sql(tbl) AS
+  'SELECT * FROM ' || array_to_string(list_transform(_psi_name_parts(tbl),
+      lambda part: '"' || replace(part, '"', '""') || '"'), '.');
+
 -- ==================================================================
 -- psi_cat_detail(ref_tbl, cur_tbl, col, eps := 1e-4)
 -- Categorical PSI detail: one row per distinct value across BOTH
@@ -26,28 +32,23 @@ CREATE OR REPLACE MACRO _psi_identifier_key(name) AS
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_cat_detail(ref_tbl, cur_tbl, col, eps := 1e-4) AS TABLE
 WITH
--- The two query_table scans MUST stay the first CTEs in this chain:
--- query_table resolves CTE names in scope (even when the argument is
--- schema-qualified), so a scan placed after an internal CTE would
--- silently read a like-named CTE instead of the user's table. At the
--- head, the only CTE name visible to the cur-side scan is
--- _psi_cat_ref_counts; the guard below turns that one residual
--- collision into an error instead of a silent mis-resolution. The
--- ref-side scan sees no CTEs at all, so any ref name resolves from the
--- catalog.
+-- Keep the input scans first: bare names can resolve to an earlier internal
+-- CTE. The only internal name visible to the current scan is
+-- _psi_cat_ref_counts; its guard prevents that collision. Caller CTEs remain
+-- available to bare names, while qualified names use normal catalog binding.
 -- Each input is referenced once and streams through UNION into one grouping.
 -- Raw values must reach that grouping: pre-grouping either input under its
 -- own collation could discard distinctions needed by the common collation.
 _psi_cat_ref_counts AS (
     SELECT coalesce(v::VARCHAR, '(NULL)') AS v
-    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query(_psi_table_sql(ref_tbl)))
 ),
 _psi_cat_cur_counts AS (
     SELECT coalesce(v::VARCHAR, '(NULL)') AS v
-    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query(_psi_table_sql(
         CASE WHEN _psi_identifier_key(_psi_name_parts(cur_tbl)[-1]) = encode('_psi_cat_ref_counts')
              THEN error('psi_cat_detail: the table name ''_psi_cat_ref_counts'' is reserved by psi_cat_detail; rename that table to compare it')
-             ELSE cur_tbl END))
+             ELSE cur_tbl END)))
 ),
 merged AS (
     -- UNION resolves a common collation before the final grouping. Joining
@@ -72,7 +73,7 @@ pcts AS (
 )
 SELECT category, ref_count, cur_count, ref_pct, cur_pct,
        (greatest(cur_pct, eps) - greatest(ref_pct, eps))
-         * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps)) AS psi_contrib
+         * (ln(greatest(cur_pct, eps)) - ln(greatest(ref_pct, eps))) AS psi_contrib
 FROM pcts
 ORDER BY category;
 
@@ -90,26 +91,21 @@ ORDER BY category;
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_detail(ref_tbl, cur_tbl, col, bins := 10, eps := 1e-4) AS TABLE
 WITH
--- The two query_table scans MUST stay the first CTEs in this chain, and
--- no other part of this macro may call query_table: query_table resolves
--- CTE names in scope (even when the argument is schema-qualified), so a
--- scan placed after an internal CTE would silently read a like-named CTE
--- instead of the user's table. At the head, the only CTE name visible to
--- the cur-side scan is _psi_ref_vals; the guard below turns that one
--- residual collision into an error instead of a silent mis-resolution.
--- The ref-side scan sees no CTEs at all, so any ref name resolves from
--- the catalog.
+-- Keep the input scans first and reuse them below. Bare names can resolve
+-- to an earlier internal CTE; only _psi_ref_vals is visible to the current
+-- scan, and its guard prevents that collision. Qualified names use normal
+-- catalog binding even when the caller defines a CTE with the same name.
 _psi_ref_vals AS (
     SELECT v::DOUBLE AS v
-    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(ref_tbl))
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query(_psi_table_sql(ref_tbl)))
     WHERE v IS NOT NULL
 ),
 _psi_cur_vals AS (
     SELECT v::DOUBLE AS v
-    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query_table(
+    FROM (SELECT COLUMNS('^' || col || '$') AS v FROM query(_psi_table_sql(
         CASE WHEN _psi_identifier_key(_psi_name_parts(cur_tbl)[-1]) = encode('_psi_ref_vals')
              THEN error('psi_detail: the table name ''_psi_ref_vals'' is reserved by psi_detail; rename that table to compare it')
-             ELSE cur_tbl END))
+             ELSE cur_tbl END)))
     WHERE v IS NOT NULL
 ),
 -- Cut points are APPROXIMATE quantiles (T-Digest) of the reference at i/bins.
@@ -204,7 +200,7 @@ SELECT
     ref_pct,
     cur_pct,
     (greatest(cur_pct, eps) - greatest(ref_pct, eps))
-      * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps)) AS psi_contrib
+      * (ln(greatest(cur_pct, eps)) - ln(greatest(ref_pct, eps))) AS psi_contrib
 FROM pcts
 ORDER BY bin;
 
@@ -284,7 +280,7 @@ CREATE OR REPLACE MACRO _psi_to_double(v) AS
 -- macros inline).
 CREATE OR REPLACE MACRO _psi_contrib(cur_pct, ref_pct, eps) AS
   (greatest(cur_pct, eps) - greatest(ref_pct, eps))
-    * ln(greatest(cur_pct, eps) / greatest(ref_pct, eps));
+    * (ln(greatest(cur_pct, eps)) - ln(greatest(ref_pct, eps)));
 
 -- Keep columns separate while converting their cells to a common STRUCT
 -- shape. Each column still retains its own VARCHAR collation at this stage.
@@ -299,13 +295,13 @@ CREATE OR REPLACE MACRO _psi_all_cells(tbl, population) AS TABLE
           -- source alias seen by alias(). Preserve case across UNION BY NAME.
           col := encode(alias(COLUMNS(*)) || ''),
           population := population)
-      FROM query_table(tbl);
+      FROM query(_psi_table_sql(tbl));
 
 -- Column catalog for a table or view: (col, kind). Accepts a bare name,
 -- 'schema.table', or 'database.schema.table', matched case-insensitively
--- (mirroring query_table resolution). Errors if a name matches more than
+-- (mirroring native identifier resolution). Errors if a name matches more than
 -- one table across schemas or databases (rather than guessing which one
--- query_table will bind) or matches nothing.
+-- the scan will bind) or matches nothing.
 CREATE OR REPLACE MACRO _psi_cols(tbl) AS TABLE
 WITH matches AS (
     SELECT database_name, schema_name, table_name, column_name, data_type
@@ -349,16 +345,9 @@ WHERE g.ok;
 -- ==================================================================
 CREATE OR REPLACE MACRO psi_all(ref_tbl, cur_tbl, bins := 10, eps := 1e-4, exclude := []) AS TABLE
 WITH
--- The input scans MUST be the first CTEs in this chain, and no other
--- part of this macro may call query_table: query_table resolves CTE names
--- in scope (even when the argument is schema-qualified), so a
--- query_table(cur_tbl) placed after e.g. the cat_ref CTE would silently
--- read that CTE instead of a user table named 'cat_ref'. Hoisted to the
--- head, the only CTE name visible to any query_table call is
--- _psi_all_ref_long (visible from the second body); the guard below turns
--- that one residual collision into an error instead of a silent
--- mis-resolution. The ref-side scan sees no CTEs at all, so any ref name
--- resolves from the catalog.
+-- Keep the input scans first and reuse them below. The only internal CTE
+-- visible to the current scan is _psi_all_ref_long; its guard prevents a
+-- bare-name collision. Qualified names use normal catalog binding.
 _psi_all_ref_long AS (
     SELECT * FROM _psi_all_cells(ref_tbl, 'ref')
 ),

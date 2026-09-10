@@ -9,7 +9,7 @@ PSI = Σ over bins of (cur% − ref%) · ln(cur% / ref%)
 
 ## Requirements
 
-DuckDB ≥ 1.3 (uses Python-style lambda syntax and `query_table`). The continuous
+DuckDB ≥ 1.3 (uses Python-style lambda syntax and `query`). The continuous
 macros also use `approx_quantile(v, FLOAT[])` and the two-argument
 `histogram(v, bounds)` aggregate; both are present in 1.5.4 (the tested version)
 — confirm their availability if you must target an older release.
@@ -134,9 +134,8 @@ to every column.
 - **`'(NULL)'` collisions**: in categorical macros, a literal string value
   `'(NULL)'` merges with real NULLs into one category.
 - **Schema-qualified tables**: names like `'myschema.mytable'` work via
-  `query_table`.
-- **Reserved table names**: `query_table` resolves in-scope CTE names before
-  catalog tables (even for schema-qualified arguments), so each macro reserves
+  native SQL name resolution and are not shadowed by caller CTEs.
+- **Reserved table names**: bare names can resolve to in-scope CTEs, so each macro reserves
   its first internal CTE name for the *current*-side argument:
   `'_psi_cat_ref_counts'` (categorical macros) and `'_psi_ref_vals'`
   (continuous macros). Passing one of these as the current table raises a
@@ -169,8 +168,9 @@ to every column.
   catalog; an ambiguous name raises an error (qualify further) instead
   of guessing. Double-quoted components are supported, including embedded
   dots, such as `'myschema."feature.v1"'`.
-- **Sweep reserved name**: DuckDB's `query_table` resolves CTE names in
-  scope — even schema-qualified ones — so `psi_all` hoists its table scans
+  Qualify names when the enclosing query has CTEs with the same bare names.
+- **Sweep reserved name**: bare names can resolve to in-scope CTEs,
+  so `psi_all` hoists its table scans
   ahead of its internal CTEs and reserves a single name: a table named
   `_psi_all_ref_long` cannot be swept as the *current* table (it raises a
   clear error; rename the table). All other table names, including ones
