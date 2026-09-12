@@ -999,6 +999,53 @@ SELECT 'psi: qualified scan preserves temporary table precedence',
 FROM psi('main.scan_temp', 'temp.main.scan_temp', 'v');
 
 ------------------------------------------------------------------
+-- Tests: nonfinite-only references cannot estimate quantile cuts
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE nonfinite_ref AS
+    SELECT 'NaN'::DOUBLE AS x FROM range(3);
+CREATE OR REPLACE TABLE nonfinite_cur AS SELECT 0::DOUBLE AS x;
+INSERT INTO _results
+SELECT 'psi: NaN-only reference reports insufficient data with counts',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data'
+            AND ref_rows = 3 AND cur_rows = 1, false),
+       'no finite observations for quantiles'
+FROM psi('nonfinite_ref', 'nonfinite_cur', 'x');
+INSERT INTO _results
+SELECT 'detail: undefined quantiles have NULL contributions',
+       coalesce(count(*) = 1 AND bool_and(coalesce(
+           psi_contrib IS NULL AND ref_count = 3 AND cur_count = 1, false)), false),
+       'counts remain visible'
+FROM psi_detail('nonfinite_ref', 'nonfinite_cur', 'x');
+INSERT INTO _results
+SELECT 'all: NaN-only reference reports insufficient data with counts',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data'
+            AND ref_rows = 3 AND cur_rows = 1, false),
+       'sweep agrees with single-column summary'
+FROM psi_all('nonfinite_ref', 'nonfinite_cur');
+INSERT INTO _results
+SELECT 'psi: explicit single bin requires no finite reference values',
+       coalesce((SELECT psi = 0 FROM psi('nonfinite_ref', 'nonfinite_cur', 'x', bins := 1))
+            AND (SELECT psi = 0 FROM psi_all('nonfinite_ref', 'nonfinite_cur', bins := 1)), false),
+       'explicit one-bin behavior retained';
+CREATE OR REPLACE TABLE infinite_ref AS
+    SELECT 'inf'::DOUBLE AS x UNION ALL SELECT '-inf'::DOUBLE;
+INSERT INTO _results
+SELECT 'psi: infinity-only reference reports insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data'
+            AND ref_rows = 2 AND cur_rows = 1, false),
+       'both numeric infinity signs'
+FROM psi('infinite_ref', 'nonfinite_cur', 'x');
+CREATE OR REPLACE TABLE infinite_date_ref AS
+    SELECT DATE 'infinity' AS d UNION ALL SELECT DATE '-infinity';
+CREATE OR REPLACE TABLE infinite_date_cur AS SELECT DATE '2024-01-01' AS d;
+INSERT INTO _results
+SELECT 'all: temporal infinity-only reference reports insufficient data',
+       coalesce(psi IS NULL AND interpretation = 'insufficient data'
+            AND ref_rows = 2 AND cur_rows = 1, false),
+       'temporal infinities retained in counts'
+FROM psi_all('infinite_date_ref', 'infinite_date_cur');
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail

@@ -131,6 +131,12 @@ to every column.
 - **NaN handling**: `NaN` values in continuous data are counted (they sort
   above all cut points, landing in the top bin) — they are not excluded like
   `NULL`.
+- **Nonfinite reference populations**: when `bins > 1` and every non-NULL
+  reference value is NaN or infinity, no quantile cuts can be estimated.
+  Continuous summaries return `psi = NULL` and `'insufficient data'`, and
+  detail contributions are NULL; row counts remain intact. This includes
+  temporal infinities in `psi_all`. Explicit `bins := 1` still compares a
+  single bin without estimating cuts.
 - **`'(NULL)'` collisions**: in categorical macros, a literal string value
   `'(NULL)'` merges with real NULLs into one category.
 - **Schema-qualified tables**: names like `'myschema.mytable'` work via

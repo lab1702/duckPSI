@@ -181,7 +181,7 @@ merged AS (
     LEFT JOIN cur_counts u USING (bin)
 ),
 pcts AS (
-    SELECT bin, cuts, ref_count, cur_count,
+    SELECT bin, cuts, ref_count, cur_count, ref_total,
            ref_count / nullif(ref_total, 0)::DOUBLE AS ref_pct,
            cur_count / nullif(cur_total, 0)::DOUBLE AS cur_pct
     FROM merged
@@ -199,8 +199,11 @@ SELECT
     cur_count,
     ref_pct,
     cur_pct,
-    (greatest(cur_pct, eps) - greatest(ref_pct, eps))
-      * (ln(greatest(cur_pct, eps)) - ln(greatest(ref_pct, eps))) AS psi_contrib
+    -- With requested cuts but no finite reference observations, the sketch
+    -- cannot define bins. Keep counts but do not claim zero drift.
+    CASE WHEN bins > 1 AND len(cuts) = 0 AND ref_total > 0 THEN NULL
+         ELSE (greatest(cur_pct, eps) - greatest(ref_pct, eps))
+           * (ln(greatest(cur_pct, eps)) - ln(greatest(ref_pct, eps))) END AS psi_contrib
 FROM pcts
 ORDER BY bin;
 
@@ -489,7 +492,10 @@ cont_merged AS (
 ),
 cont_summary AS (
     SELECT col,
-           CASE WHEN max(ref_total) = 0 OR max(cur_total) = 0 THEN NULL
+           -- For bins > 1, a single scaffold bin means the nonempty
+           -- reference sketch had no finite observations and no cuts.
+           CASE WHEN max(ref_total) = 0 OR max(cur_total) = 0
+                     OR (bins > 1 AND count(*) = 1) THEN NULL
                 ELSE sum(_psi_contrib(cur_count / nullif(cur_total, 0)::DOUBLE,
                                       ref_count / nullif(ref_total, 0)::DOUBLE, eps)) END AS psi,
            count(*)::INT AS groups,
