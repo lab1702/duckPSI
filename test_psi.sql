@@ -1046,6 +1046,36 @@ SELECT 'all: temporal infinity-only reference reports insufficient data',
 FROM psi_all('infinite_date_ref', 'infinite_date_cur');
 
 ------------------------------------------------------------------
+-- Tests: decimal collections use categorical dispatch
+------------------------------------------------------------------
+CREATE OR REPLACE TABLE decimal_collection_ref (
+    items DECIMAL(10,2)[], fixed_items DECIMAL(10,2)[1], nested DECIMAL(10,2)[][]);
+CREATE OR REPLACE TABLE decimal_collection_cur AS SELECT * FROM decimal_collection_ref;
+INSERT INTO decimal_collection_ref VALUES ([1.00], [1.00], [[1.00]]);
+INSERT INTO decimal_collection_cur VALUES ([2.00], [2.00], [[2.00]]);
+INSERT INTO _results
+SELECT 'all: decimal lists and arrays retain categorical counts and drift',
+       coalesce(count(*) = 3 AND bool_and(coalesce(
+           kind = 'categorical' AND status = 'ok' AND groups = 2
+           AND ref_rows = 1 AND cur_rows = 1
+           AND abs(psi - 18.418838675877968) < 1e-12, false)), false),
+       'variable, fixed, and nested decimal collections'
+FROM psi_all('decimal_collection_ref', 'decimal_collection_cur');
+INSERT INTO _results
+SELECT 'all: decimal collection agrees with categorical summary',
+       coalesce(psi = (SELECT psi FROM psi_cat(
+           'decimal_collection_ref', 'decimal_collection_cur', 'items')), false),
+       'single-column agreement'
+FROM psi_all('decimal_collection_ref', 'decimal_collection_cur') WHERE "column" = 'items';
+INSERT INTO _results
+SELECT 'all-helpers: only scalar decimals are continuous',
+       coalesce(_psi_kind('DECIMAL(38,0)') = 'continuous'
+           AND _psi_kind('DECIMAL(10,2)[]') = 'categorical'
+           AND _psi_kind('DECIMAL(10,2)[1]') = 'categorical'
+           AND _psi_kind('DECIMAL(10,2)[][]') = 'categorical', false),
+       'anchored scalar type matching';
+
+------------------------------------------------------------------
 -- Report (KEEP LAST — later tasks insert their tests above this)
 ------------------------------------------------------------------
 SELECT name, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS status, detail

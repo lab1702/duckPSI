@@ -263,7 +263,7 @@ CREATE OR REPLACE MACRO _psi_kind(dt) AS
   CASE WHEN dt IN ('TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT',
                    'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'UHUGEINT',
                    'FLOAT', 'DOUBLE', 'DATE', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE')
-         OR dt LIKE 'DECIMAL%'
+         OR regexp_full_match(dt, 'DECIMAL\([0-9]+,[0-9]+\)')
        THEN 'continuous' ELSE 'categorical' END;
 
 -- Native cell -> DOUBLE, before the long-format reshape erases its type.
